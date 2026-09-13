@@ -1,0 +1,8 @@
+Copyright (c) 2026 SE7EN Solutions. All rights reserved.
+
+This source is published for transparency and security review. No open-source
+license is granted. Permissions beyond those provided by applicable law and
+the hosting platform's terms require separate written authorization.
+
+Third-party dependencies remain subject to their respective licenses.
+For licensing inquiries, contact info@se7en.ws.

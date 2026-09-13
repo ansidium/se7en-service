@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://7launcher.com/schemas/maintenance-keyring-v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "authenticodeSignerThumbprints": {
+      "items": {
+        "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "kind": {
+      "const": "7launcher-maintenance-keyring-v1"
+    },
+    "releaseKeys": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "keyId": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "publicKey": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": ["keyId", "publicKey"],
+        "type": "object"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "type": "array"
+    },
+    "schema": {
+      "const": 1
+    },
+    "signature": {
+      "pattern": "^[0-9a-f]{128}$",
+      "type": "string"
+    },
+    "version": {
+      "maximum": 18446744073709551615,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "authenticodeSignerThumbprints",
+    "kind",
+    "releaseKeys",
+    "schema",
+    "signature",
+    "version"
+  ],
+  "title": "7Launcher maintenance keyring v1",
+  "type": "object"
+}

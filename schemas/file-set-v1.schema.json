@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://7launcher.com/schemas/file-set-v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "files": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "size": {
+            "maximum": 2199023255552,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": ["path", "sha256", "size"],
+        "type": "object"
+      },
+      "maxItems": 100000,
+      "type": "array"
+    },
+    "generation": {
+      "maximum": 18446744073709551615,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "keyId": {
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "kind": {
+      "const": "7launcher-file-set-v1"
+    },
+    "productId": {
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "removeFiles": {
+      "items": {
+        "maxLength": 1024,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 100000,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "schema": {
+      "const": 1
+    },
+    "signature": {
+      "pattern": "^[0-9a-f]{128}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "files",
+    "generation",
+    "keyId",
+    "kind",
+    "productId",
+    "removeFiles",
+    "schema",
+    "signature"
+  ],
+  "title": "7Launcher FileSet v1",
+  "type": "object"
+}

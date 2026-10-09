@@ -2,19 +2,24 @@
 //!
 //! Both executables must start on a clean Windows installation without the Visual C++
 //! Redistributable, so they must not import the dynamic CRT. Non-KnownDLL dependencies such as
-//! `wintrust.dll` and `crypt32.dll` must load only from System32.
+//! `wintrust.dll` and `crypt32.dll` must load only from System32. Both are built with Control Flow
+//! Guard and carry an application manifest that runs them as the invoking user.
 
 use std::{env, fs, path::Path};
 
 const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 const IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
+const IMAGE_DIRECTORY_ENTRY_RESOURCE: usize = 2;
 const IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
+const IMAGE_DLLCHARACTERISTICS_GUARD_CF: u16 = 0x4000;
+const RT_MANIFEST: u32 = 24;
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u16 = 0x0800;
 const MAX_IMPORTED_MODULES: usize = 512;
 
 struct PeImage {
     bytes: Vec<u8>,
     pe32_plus: bool,
+    dll_characteristics: u16,
     data_directories: Vec<(u32, u32)>,
     sections: Vec<Section>,
 }
@@ -63,6 +68,8 @@ impl PeImage {
             0x20b => (true, 108),
             magic => return Err(format!("unknown optional header magic {magic:#x}")),
         };
+        // DllCharacteristics has the same offset in PE32 and PE32+ optional headers.
+        let dll_characteristics = u16_at(&bytes, optional + 70)?;
         let directory_count = index(u32_at(&bytes, optional + directory_count_offset)?)?.min(16);
         let directories = optional + directory_count_offset + 4;
         let data_directories = (0..directory_count)
@@ -86,6 +93,7 @@ impl PeImage {
         Ok(Self {
             bytes,
             pe32_plus,
+            dll_characteristics,
             data_directories,
             sections,
         })
@@ -154,6 +162,22 @@ impl PeImage {
     }
 
     /// `IMAGE_LOAD_CONFIG_DIRECTORY::DependentLoadFlags`, written by `/DEPENDENTLOADFLAG`.
+    /// Whether the root resource directory has an entry for the numeric resource `type_id`.
+    fn has_resource_type(&self, type_id: u32) -> Result<bool, String> {
+        let Some((rva, _)) = self.directory(IMAGE_DIRECTORY_ENTRY_RESOURCE) else {
+            return Ok(false);
+        };
+        let root = self.offset(rva)?;
+        let named = usize::from(u16_at(&self.bytes, root + 12)?);
+        let numbered = usize::from(u16_at(&self.bytes, root + 14)?);
+        for entry in named..named + numbered {
+            if u32_at(&self.bytes, root + 16 + entry * 8)? == type_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn dependent_load_flags(&self) -> Result<u16, String> {
         let (rva, _) = self
             .directory(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
@@ -211,6 +235,28 @@ fn assert_standalone_image(path: &Path) {
         flags & LOAD_LIBRARY_SEARCH_SYSTEM32,
         LOAD_LIBRARY_SEARCH_SYSTEM32,
         "{}: dependent DLLs must load only from System32 (/DEPENDENTLOADFLAG:0x800)",
+        path.display()
+    );
+    assert_ne!(
+        image.dll_characteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF,
+        0,
+        "{}: build with -C control-flow-guard",
+        path.display()
+    );
+    assert!(
+        image
+            .has_resource_type(RT_MANIFEST)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display())),
+        "{}: the application manifest is not embedded",
+        path.display()
+    );
+    let manifest = br#"<requestedExecutionLevel level="asInvoker" uiAccess="false"/>"#;
+    assert!(
+        image
+            .bytes
+            .windows(manifest.len())
+            .any(|window| window == manifest),
+        "{}: the manifest must request asInvoker",
         path.display()
     );
 }

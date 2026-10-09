@@ -8,6 +8,7 @@ fn main() {
     println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=assets/service.ico");
+    println!("cargo::rerun-if-changed=assets/app.manifest");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // Without the Visual C++ Redistributable a dynamic-CRT build does not start, and the
         // LocalSystem service would search PATH for the missing DLL.
@@ -49,8 +50,17 @@ fn compile_windows_version_resources() {
     .expect("7Launcher icon resource is unavailable")
     .to_string_lossy()
     .replace('\\', "/");
+    let manifest_path = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory is unavailable"),
+    )
+    .join("assets/app.manifest")
+    .canonicalize()
+    .expect("application manifest is unavailable")
+    .to_string_lossy()
+    .replace('\\', "/");
     let resource = windows_version_resource(
         &icon_path,
+        &manifest_path,
         &version,
         major,
         minor,
@@ -69,6 +79,7 @@ fn compile_windows_version_resources() {
 
     let manager_resource = windows_version_resource(
         &icon_path,
+        &manifest_path,
         &version,
         major,
         minor,
@@ -91,6 +102,7 @@ fn compile_windows_version_resources() {
 #[allow(clippy::too_many_arguments)]
 fn windows_version_resource(
     icon_path: &str,
+    manifest_path: &str,
     version: &str,
     major: u16,
     minor: u16,
@@ -102,6 +114,7 @@ fn windows_version_resource(
 ) -> String {
     format!(
         r#"2 ICON "{icon_path}"
+1 24 "{manifest_path}"
 
 1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},0

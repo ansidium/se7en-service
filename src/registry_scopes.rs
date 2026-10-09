@@ -305,36 +305,42 @@ pub(crate) fn validate_registry_subkey(value: &str) -> Result<()> {
             "registry subkey is not a canonical HKLM SOFTWARE path",
         ));
     }
-    let folded = value.to_ascii_lowercase();
-    // Each of these runs code or changes security for every user: Image File Execution Options
-    // and Winlogon live under Windows NT, cmd.exe runs Command Processor\AutoRun, Active Setup
-    // runs StubPath at logon.
-    const FORBIDDEN_PREFIXES: [&str; 10] = [
-        "software\\classes",
-        "software\\microsoft\\active setup",
-        "software\\microsoft\\command processor",
-        "software\\microsoft\\windows",
-        "software\\microsoft\\windows defender",
-        "software\\microsoft\\windows nt",
-        "software\\policies",
-        "software\\wow6432node\\classes",
-        "software\\wow6432node\\microsoft\\windows",
-        "software\\wow6432node\\policies",
-    ];
-    if folded.starts_with("software\\wow6432node\\")
-        || FORBIDDEN_PREFIXES.iter().any(|prefix| {
-            folded == *prefix
-                || folded
-                    .strip_prefix(prefix)
-                    .is_some_and(|suffix| suffix.starts_with('\\'))
-        })
-    {
+    if !product_key_is_allowed(&value.to_ascii_lowercase()) {
         return Err(MaintenanceError::new(
             ErrorCode::RegistryScopeUnauthorized,
-            "registry subkey belongs to a protected Windows policy or persistence area",
+            "registry scope must be a product key outside Windows and platform namespaces",
         ));
     }
     Ok(())
+}
+
+/// Like the registry section of a Steam install script, a scope is one product's own key:
+/// `SOFTWARE\<publisher>\<product>[\...]`. Publishers are open-ended, so the check rejects the
+/// namespaces of Windows and of platforms that load code into other processes or apply policy.
+/// The 32-bit view replaces explicit `WOW6432Node` paths.
+fn product_key_is_allowed(folded: &str) -> bool {
+    let components: Vec<&str> = folded.split('\\').collect();
+    let (publisher, product) = match components.as_slice() {
+        ["software", publisher, product, ..] => (*publisher, *product),
+        _ => return false,
+    };
+    match publisher {
+        // Windows, COM, default programs, policies and the 32-bit view.
+        "classes"
+        | "clients"
+        | "policies"
+        | "registeredapplications"
+        | "windows"
+        | "wow6432node" => false,
+        // Only games published by Microsoft: SOFTWARE\Microsoft\Microsoft Games\<game>.
+        "microsoft" => product == "microsoft games" && components.len() >= 4,
+        // Vulkan and OpenCL layers and drivers load into every process that uses them.
+        "khronos" => false,
+        // Browser native-messaging hosts start programs; browser policies change security.
+        "mozilla" => false,
+        "google" => product != "chrome",
+        _ => true,
+    }
 }
 
 fn valid_owner_sid(value: &str) -> bool {
@@ -426,6 +432,70 @@ mod tests {
                 .expect_err("Windows persistence areas fail closed")
                 .code(),
                 ErrorCode::RegistryScopeUnauthorized
+            );
+        }
+    }
+
+    fn scope_result(subkey: &str, value_name: &str) -> Result<RegisteredRegistryScope> {
+        RegisteredRegistryScope::new(
+            "policy-scope",
+            "sample-app",
+            RegistryView::Registry64,
+            subkey,
+            vec![AllowedRegistryValue {
+                name: value_name.to_owned(),
+                value_type: RegistryValueKind::String,
+            }],
+            "S-1-5-21-1000",
+        )
+    }
+
+    #[test]
+    fn scopes_are_product_keys_like_steam_install_scripts() {
+        for allowed in [
+            r"SOFTWARE\Rockstar Games\Grand Theft Auto V",
+            r"SOFTWARE\Valve\Half-Life 2",
+            r"SOFTWARE\Microsoft\Microsoft Games\Age of Empires II",
+            r"SOFTWARE\SE7EN\ServiceE2E\RegistrySetV1",
+        ] {
+            scope_result(allowed, "Language").unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        for forbidden in [
+            // A whole publisher tree is not one product.
+            r"SOFTWARE\ExampleVendor",
+            r"SOFTWARE\Microsoft\Microsoft Games",
+            // Platform namespaces that load code into other processes or set policy.
+            r"SOFTWARE\Microsoft\Office\Addins",
+            r"SOFTWARE\Microsoft\.NETFramework\AppContext",
+            r"SOFTWARE\Khronos\Vulkan\ImplicitLayers",
+            r"SOFTWARE\Khronos\OpenCL\Vendors",
+            r"SOFTWARE\Google\Chrome\NativeMessagingHosts",
+            r"SOFTWARE\Mozilla\NativeMessagingHosts",
+            r"SOFTWARE\Clients\StartMenuInternet",
+            r"SOFTWARE\RegisteredApplications\Example",
+            r"SOFTWARE\Windows\Example",
+        ] {
+            assert_eq!(
+                scope_result(forbidden, "Language")
+                    .expect_err(forbidden)
+                    .code(),
+                ErrorCode::RegistryScopeUnauthorized,
+                "{forbidden}"
+            );
+        }
+        for value in [
+            "Debugger",
+            "AUTORUN",
+            "StubPath",
+            "AppInit_DLLs",
+            "Userinit",
+        ] {
+            assert_eq!(
+                scope_result(r"SOFTWARE\ExampleVendor\SampleApp", value)
+                    .expect_err(value)
+                    .code(),
+                ErrorCode::RegistryValueInvalid,
+                "{value}"
             );
         }
     }

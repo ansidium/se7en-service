@@ -263,6 +263,22 @@ pub(crate) fn decode_registry_binary(data: &str) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
+/// Value names that Windows reads to start a program or load a DLL wherever they appear in a
+/// matching key. A game setting never needs one, so no scope may allow them.
+const EXECUTING_VALUE_NAMES: [&str; 11] = [
+    "AppInit_DLLs",
+    "AutoRun",
+    "Debugger",
+    "GlobalFlag",
+    "LoadAppInit_DLLs",
+    "MonitorProcess",
+    "Shell",
+    "StubPath",
+    "Taskman",
+    "Userinit",
+    "VerifierDlls",
+];
+
 pub fn validate_allowed_registry_values(values: &[AllowedRegistryValue]) -> Result<()> {
     if values.is_empty() || values.len() > MAX_REGISTRY_ENTRIES {
         return Err(MaintenanceError::new(
@@ -273,6 +289,15 @@ pub fn validate_allowed_registry_values(values: &[AllowedRegistryValue]) -> Resu
     let mut names = HashSet::with_capacity(values.len());
     for value in values {
         validate_registry_value_name(&value.name)?;
+        if EXECUTING_VALUE_NAMES
+            .iter()
+            .any(|name| value.name.eq_ignore_ascii_case(name))
+        {
+            return Err(MaintenanceError::new(
+                ErrorCode::RegistryValueInvalid,
+                "registry value name is one that Windows uses to start programs",
+            ));
+        }
         if !names.insert(value.name.to_lowercase()) {
             return Err(MaintenanceError::new(
                 ErrorCode::RegistryValueInvalid,

@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "seven-launcher-maintenance"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "base64",
  "ed25519-dalek",

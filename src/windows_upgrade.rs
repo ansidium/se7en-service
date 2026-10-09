@@ -54,7 +54,7 @@ use windows::{
 };
 
 use crate::{
-    ErrorCode, FileSetAcceptance, GenerationRecord, MAX_MANIFEST_BYTES, MaintenanceError, Result,
+    ErrorCode, FileSetAcceptance, MAX_MANIFEST_BYTES, MaintenanceError, Result,
     service_upgrade::{
         EnsureServiceOutcome, SERVICE_BINARY_NAME, SERVICE_BUNDLE_PRODUCT_ID, ServiceReleaseRecord,
         ServiceUpgradeJournal, ServiceUpgradePlatform, UpgradeDecision, decide_service_upgrade,
@@ -167,21 +167,15 @@ fn install_system_service(
     let keyring_bytes = read_service_file(keyring_path, MAX_MANIFEST_BYTES)?;
     let keyring = verify_candidate_keyring_bytes(&keyring_bytes)?;
     let manifest_bytes = read_service_file(manifest_path, MAX_MANIFEST_BYTES)?;
-    let previous = installed
-        .as_ref()
-        .map(|record| {
-            Ok(GenerationRecord {
-                generation: record.generation(),
-                digest: record.digest()?,
-            })
-        })
-        .transpose()?;
+    // The signature, product and digest are verified here; ordering against the installed
+    // release is decided by the service version in decide_service_upgrade, not by the
+    // bundle generation, which service releases keep at 1.
     let manifest = verify_file_set(
         &manifest_bytes,
         &keyring,
         FileSetAcceptance {
             expected_product_id: SERVICE_BUNDLE_PRODUCT_ID,
-            previous,
+            previous: None,
         },
     )?;
     let entry = validate_service_bundle(&manifest)?;

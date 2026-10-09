@@ -223,35 +223,22 @@ pub fn decide_service_upgrade(
             "cross-major maintenance service upgrade is forbidden",
         ));
     }
+    // The service version alone orders releases. The bundle generation is a required field of
+    // the signed format, but service releases do not advance it: each new build gets a new
+    // version, and one version never names different bytes.
     match candidate_version.cmp(&installed_version) {
         Ordering::Less => Err(MaintenanceError::new(
             ErrorCode::FileSetRollback,
             "candidate maintenance service version is older than the installed version",
         )),
-        Ordering::Equal => match candidate.generation.cmp(&installed.generation) {
-            Ordering::Less => Err(MaintenanceError::new(
-                ErrorCode::FileSetRollback,
-                "candidate release generation is older than the installed generation",
-            )),
-            Ordering::Equal if candidate.digest == installed.digest => {
-                Ok(UpgradeDecision::KeepCompatible)
-            }
-            Ordering::Equal => Err(MaintenanceError::new(
-                ErrorCode::GenerationConflict,
-                "one release generation cannot identify different service bytes",
-            )),
-            Ordering::Greater => Ok(UpgradeDecision::Upgrade),
-        },
-        Ordering::Greater => {
-            if candidate.generation <= installed.generation {
-                Err(MaintenanceError::new(
-                    ErrorCode::GenerationConflict,
-                    "newer maintenance service version must advance the release generation",
-                ))
-            } else {
-                Ok(UpgradeDecision::Upgrade)
-            }
+        Ordering::Equal if candidate.digest == installed.digest => {
+            Ok(UpgradeDecision::KeepCompatible)
         }
+        Ordering::Equal => Err(MaintenanceError::new(
+            ErrorCode::GenerationConflict,
+            "one service version cannot identify different service bytes",
+        )),
+        Ordering::Greater => Ok(UpgradeDecision::Upgrade),
     }
 }
 

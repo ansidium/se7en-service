@@ -60,34 +60,40 @@ fn upgrade_decision_installs_keeps_and_advances_only_same_major() {
 }
 
 #[test]
-fn upgrade_rejects_generation_or_digest_reuse() {
-    let current = ServiceReleaseRecord::new("1.2.0", 10, digest(1)).unwrap();
-    let reused_version_generation = ServiceReleaseRecord::new("1.2.0", 10, digest(2)).unwrap();
-    let reused_generation = ServiceReleaseRecord::new("1.3.0", 10, digest(2)).unwrap();
-
+fn the_service_version_alone_orders_releases() {
+    // The bundle generation is a fixed format field; installed 1.0.2 releases carry 1 to 4.
+    let installed = ServiceReleaseRecord::new("1.0.2", 4, digest(0x22)).unwrap();
+    let newer = ServiceReleaseRecord::new("1.0.3", 1, digest(0x33)).unwrap();
     assert_eq!(
-        decide_service_upgrade(&reused_version_generation, Some(&current))
-            .unwrap_err()
-            .code(),
-        ErrorCode::GenerationConflict
+        decide_service_upgrade(&newer, Some(&installed)).expect("a newer version upgrades"),
+        UpgradeDecision::Upgrade
     );
     assert_eq!(
-        decide_service_upgrade(&reused_generation, Some(&current))
+        decide_service_upgrade(&installed, Some(&newer))
             .unwrap_err()
             .code(),
-        ErrorCode::GenerationConflict
+        ErrorCode::FileSetRollback
+    );
+    let same = ServiceReleaseRecord::new("1.0.3", 7, digest(0x33)).unwrap();
+    assert_eq!(
+        decide_service_upgrade(&same, Some(&newer)).unwrap(),
+        UpgradeDecision::KeepCompatible
     );
 }
 
 #[test]
-fn same_service_version_can_advance_internal_release_generation() {
+fn one_service_version_cannot_name_different_bytes() {
     let installed = ServiceReleaseRecord::new("1.0.2", 2, digest(0x22)).unwrap();
-    let candidate = ServiceReleaseRecord::new("1.0.2", 3, digest(0x33)).unwrap();
-    assert_eq!(
-        decide_service_upgrade(&candidate, Some(&installed)).expect("generation advances"),
-        UpgradeDecision::Upgrade
-    );
-    assert!(decide_service_upgrade(&installed, Some(&candidate)).is_err());
+    for generation in [1, 2, 3] {
+        let rebuilt = ServiceReleaseRecord::new("1.0.2", generation, digest(0x33)).unwrap();
+        assert_eq!(
+            decide_service_upgrade(&rebuilt, Some(&installed))
+                .unwrap_err()
+                .code(),
+            ErrorCode::GenerationConflict,
+            "generation {generation}"
+        );
+    }
 }
 
 #[test]

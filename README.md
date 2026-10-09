@@ -86,9 +86,10 @@ Each release includes the service, manager, signed bundle manifests, and
 `SHA256SUMS.txt`. Earlier releases keep their original bytes and signatures.
 
 The source starts with a standalone snapshot and contains no launcher application
-source or private repository history. Release notes identify the generation and
-verification performed. For an antivirus report, use the exact affected file
-and its SHA-256; the version string alone does not distinguish release generations.
+source or private repository history. Release notes identify the verification
+performed. Since 1.0.3 every build has its own version; for an antivirus report,
+still use the exact affected file and its SHA-256, because releases up to 1.0.2
+shared one version string across several builds.
 
 Copyright (c) 2026 SE7EN Solutions. All rights reserved. The source is available
 for review under [LICENSE.txt](LICENSE.txt); it is not distributed under an

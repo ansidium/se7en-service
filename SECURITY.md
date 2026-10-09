@@ -19,7 +19,7 @@ to the appropriate release.
 | Boundary | Implementation |
 | --- | --- |
 | Strict IPC parsing and request limits | `src/protocol.rs` |
-| Caller identity, authorization, named pipe and Authenticode | `src/windows.rs` |
+| Caller identity, authorization, named pipe and Authenticode | `src/windows.rs`, `src/windows_pipe.rs` |
 | Signed keyrings, file sets and registry sets | `src/trust.rs`, `src/file_set.rs`, `src/registry_set.rs` |
 | Registered paths and registry scopes | `src/roots.rs`, `src/registry_scopes.rs` |
 | Transactions and recovery | `src/transaction.rs` |

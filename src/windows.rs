@@ -33,8 +33,8 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA,
-            ERROR_PATH_NOT_FOUND, ERROR_PIPE_CONNECTED, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
-            HLOCAL, HWND, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_PATH_NOT_FOUND, ERROR_SERVICE_ALREADY_RUNNING, HANDLE, HLOCAL, HWND, LocalFree,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -67,22 +67,19 @@ use windows::{
             FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
             FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFO_EX,
             FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE,
-            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-            FILE_READ_DATA, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_WRITE_DATA, FileAttributeTagInfo,
-            FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FileRenameInfo, FileStandardInfo,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+            FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_STANDARD_INFO, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
+            FileDispositionInfoEx, FileIdInfo, FileRenameInfo, FileStandardInfo,
             GetDiskFreeSpaceExW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-            OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SetFileInformationByHandle,
-            WRITE_DAC, WriteFile,
+            OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
         },
         System::{
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
-                ImpersonateNamedPipeClient, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState, TransactNamedPipe,
-                WaitNamedPipeW,
+                ImpersonateNamedPipeClient, PIPE_READMODE_MESSAGE, SetNamedPipeHandleState,
+                TransactNamedPipe,
             },
             Registry::{
                 HKEY, HKEY_LOCAL_MACHINE, KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_SET_VALUE,
@@ -92,20 +89,20 @@ use windows::{
             },
             Services::{
                 ChangeServiceConfig2W, CloseServiceHandle, CreateServiceW, OpenSCManagerW,
-                OpenServiceW, RegisterServiceCtrlHandlerExW, SC_HANDLE, SC_MANAGER_CONNECT,
-                SC_MANAGER_CREATE_SERVICE, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
-                SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_CONTROL_STOP,
-                SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL,
-                SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_SID_INFO, SERVICE_START,
-                SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
-                SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
+                OpenServiceW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW, SC_HANDLE,
+                SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO,
+                SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_CONFIG_DESCRIPTION,
+                SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
+                SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+                SERVICE_SID_INFO, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
+                SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS,
+                SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
                 SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity, SetServiceStatus,
                 StartServiceCtrlDispatcherW, StartServiceW,
             },
             Threading::{
                 CreateEventW, EVENT_MODIFY_STATE, GetCurrentThread, OpenEventW, OpenProcess,
-                OpenThreadToken, PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects,
-                WaitForSingleObject,
+                OpenThreadToken, PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
             },
         },
     },
@@ -131,11 +128,18 @@ use crate::{
 
 #[path = "windows_data_directory.rs"]
 mod data_directory;
+#[path = "windows_pipe.rs"]
+mod pipe;
 #[path = "windows_upgrade.rs"]
 mod upgrade;
 use data_directory::{
     open_service_data_directory, program_files_root, provision_service_data_directory,
     service_data_directory,
+};
+use pipe::{
+    PIPE_READ_TIMEOUT as SERVICE_PIPE_READ_TIMEOUT,
+    PIPE_WRITE_TIMEOUT as SERVICE_PIPE_WRITE_TIMEOUT, PipeEvent, PipeServer,
+    SERVICE_PIPE_INSTANCES,
 };
 use sha2::{Digest, Sha256};
 pub use upgrade::{
@@ -280,6 +284,14 @@ impl Drop for KernelHandle {
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
+
+/// A kernel handle passed to another thread of this process.
+#[derive(Clone, Copy)]
+struct SendHandle(HANDLE);
+
+// SAFETY: a kernel handle is a process-wide value that is valid on every thread. Each sender
+// keeps the handle open until the receiving thread has finished using it.
+unsafe impl Send for SendHandle {}
 
 struct RegistryKey(HKEY);
 
@@ -515,6 +527,10 @@ fn install_verified_keyring_bytes(source_bytes: &[u8]) -> Result<()> {
 /// Starts the shared service with only START/QUERY_STATUS rights. It never requests stop, config,
 /// delete, or DACL rights from an ordinary client token.
 pub fn start_shared_service() -> Result<()> {
+    open_and_start_shared_service().map(|_| ())
+}
+
+fn open_and_start_shared_service() -> Result<ServiceHandle> {
     // SAFETY: null names select the local active SCM database; the returned handle is owned below.
     let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
         .map(ServiceHandle)
@@ -542,9 +558,9 @@ pub fn start_shared_service() -> Result<()> {
     })?;
     // SAFETY: the service handle has START rights and no service arguments are accepted.
     match unsafe { StartServiceW(service.0, None) } {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(service),
         Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => {
-            Ok(())
+            Ok(service)
         }
         Err(_) => Err(MaintenanceError::new(
             ErrorCode::TransactionIo,
@@ -553,38 +569,33 @@ pub fn start_shared_service() -> Result<()> {
     }
 }
 
+/// The process ID the SCM reports for the running maintenance service.
+fn running_service_process_id(service: &ServiceHandle) -> Option<u32> {
+    let mut status = MaybeUninit::<SERVICE_STATUS_PROCESS>::zeroed();
+    let mut needed = 0_u32;
+    // SAFETY: the byte view covers exactly the zero-initialized, correctly aligned status value,
+    // which stays alive and is not otherwise accessed during the synchronous call.
+    let buffer = unsafe {
+        std::slice::from_raw_parts_mut(
+            status.as_mut_ptr().cast::<u8>(),
+            size_of::<SERVICE_STATUS_PROCESS>(),
+        )
+    };
+    // SAFETY: the handle has SERVICE_QUERY_STATUS and the buffer has the size of the requested
+    // SC_STATUS_PROCESS_INFO structure.
+    unsafe { QueryServiceStatusEx(service.0, SC_STATUS_PROCESS_INFO, Some(buffer), &mut needed) }
+        .ok()?;
+    // SAFETY: the value was zero-initialized and the successful call filled it.
+    let status = unsafe { status.assume_init() };
+    (status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId != 0)
+        .then_some(status.dwProcessId)
+}
+
 /// Sends one typed IPC v1 request and returns one bounded JSON response.
 pub fn call_shared_service(request: &Request) -> Result<serde_json::Value> {
-    start_shared_service()?;
-    let pipe_name = wide_null(PIPE_NAME);
-    let pipe_path = Path::new(PIPE_NAME);
-    let pipe = wait_for_pipe_ready_with(
-        PIPE_READY_TIMEOUT,
-        |wait_milliseconds| {
-            // SAFETY: the pipe name is NUL-terminated and the wait slice is finite. WaitNamedPipeW
-            // returns immediately while the service has reported Running but has not created its
-            // first pipe instance, so the bounded outer retry is required.
-            if !unsafe { WaitNamedPipeW(PCWSTR(pipe_name.as_ptr()), wait_milliseconds) }.as_bool() {
-                return None;
-            }
-            // A successful wait does not reserve the instance. Retrying the open also covers the
-            // documented race where another client opens or the service replaces that instance.
-            open_absolute(
-                pipe_path,
-                PIPE_CLIENT_ACCESS_MASK,
-                windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-            )
-            .ok()
-        },
-        thread::sleep,
-    )
-    .ok_or_else(|| {
-        MaintenanceError::new(
-            ErrorCode::TransactionIo,
-            "shared maintenance pipe did not become ready",
-        )
+    let service = open_and_start_shared_service()?;
+    let pipe = pipe::open_verified_client(PIPE_NAME, PIPE_READY_TIMEOUT, || {
+        running_service_process_id(&service)
     })?;
     let encoded = serde_json::to_vec(request).map_err(|_| {
         MaintenanceError::new(
@@ -814,33 +825,6 @@ pub fn wait_for_process_exit(process_id: u32) -> Result<()> {
     let process = LauncherProcess::open(process_id)?;
     while !process.wait(Duration::from_secs(30))? {}
     Ok(())
-}
-
-/// Creates a single local message-mode server pipe with an explicit DACL. Remote clients are
-/// rejected by the kernel before protocol decoding.
-fn create_server_pipe() -> Result<KernelHandle> {
-    let pipe_name = wide_null(PIPE_NAME);
-    let mut descriptor = LocalSecurityDescriptor::parse(PIPE_DACL_SDDL)?;
-    let attributes = descriptor.attributes();
-    // SAFETY: the name is NUL-terminated, the security attributes and descriptor outlive the
-    // synchronous call, and all buffer/count values are bounded constants.
-    let handle = unsafe {
-        CreateNamedPipeW(
-            PCWSTR(pipe_name.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
-            64 * 1024,
-            64 * 1024,
-            30_000,
-            Some(ptr::from_ref(&attributes)),
-        )
-    };
-    KernelHandle::new(
-        handle,
-        ErrorCode::TransactionIo,
-        "local maintenance pipe could not be created",
-    )
 }
 
 struct ImpersonationGuard {
@@ -2889,7 +2873,6 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static COMMITTING: AtomicBool = AtomicBool::new(false);
 static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static STOP_EVENT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-static CURRENT_PIPE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 const GENERATION_REGISTRY_KIND: &str = "7launcher-maintenance-generations-v1";
 const GENERATION_REGISTRY_SCHEMA: u64 = 1;
@@ -3107,12 +3090,6 @@ unsafe extern "system" fn service_control_handler(
                 // SAFETY: the service loop publishes a live event handle until it exits.
                 let _ = unsafe { SetEvent(HANDLE(stop_event)) };
             }
-            let pipe = CURRENT_PIPE.load(Ordering::SeqCst);
-            if !pipe.is_null() {
-                // SAFETY: the service loop publishes a live pipe handle; CancelIoEx is explicitly
-                // safe to call from a different thread and only requests cancellation.
-                let _ = unsafe { CancelIoEx(HANDLE(pipe), None) };
-            }
         }
     }
     0
@@ -3176,39 +3153,209 @@ fn service_loop() -> Result<()> {
         active_job: None,
     };
 
+    // Claim the pipe name before reporting Running: a client that sees Running must find this
+    // process's instances, and a name that another process already holds stops the service.
+    let mut server = PipeServer::create(
+        PIPE_NAME,
+        SERVICE_PIPE_INSTANCES,
+        SERVICE_PIPE_READ_TIMEOUT,
+        SERVICE_PIPE_WRITE_TIMEOUT,
+    )?;
+    let wake = create_event(false, false)?;
     report_status(SERVICE_RUNNING, true, 0)?;
-    while !STOP_REQUESTED.load(Ordering::SeqCst) {
-        let pipe = create_server_pipe()?;
-        CURRENT_PIPE.store(pipe.raw().0, Ordering::SeqCst);
-        let connected = connect_pipe_or_stop(pipe.raw(), stop_event.raw())?;
-        if !connected {
-            CURRENT_PIPE.store(ptr::null_mut(), Ordering::SeqCst);
-            if COMMITTING.load(Ordering::SeqCst) {
-                continue;
-            }
-            break;
-        }
-        let response = match read_pipe_message(pipe.raw())
-            .and_then(|bytes| crate::protocol::decode_request(&bytes))
-            .and_then(|request| process_request(pipe.raw(), request, &mut state))
+    let idle_timeout = Duration::from_millis(u64::from(SERVICE_IDLE_TIMEOUT_MS));
+    let mut preparing: Option<PrepareInFlight> = None;
+    let result = loop {
+        // A commit ends with the stop event when a stop was requested meanwhile; until then the
+        // service keeps answering status requests instead of exiting under the commit worker.
+        if STOP_REQUESTED.load(Ordering::SeqCst)
+            && !COMMITTING.load(Ordering::SeqCst)
+            && preparing.is_none()
         {
-            Ok(response) => response,
-            Err(error) => maintenance_error_response(&error),
-        };
-        let encoded = serde_json::to_vec(&response).map_err(|_| {
-            MaintenanceError::new(ErrorCode::ProtocolInvalid, "IPC response cannot be encoded")
-        })?;
-        if encoded.len() <= MAX_IPC_MESSAGE_BYTES {
-            let _ = write_pipe_message(pipe.raw(), &encoded);
+            break Ok(());
         }
-        // SAFETY: this is a connected server pipe owned by the current loop iteration.
-        let _ = unsafe { DisconnectNamedPipe(pipe.raw()) };
-        CURRENT_PIPE.store(ptr::null_mut(), Ordering::SeqCst);
+        let event = match server.next_event(stop_event.raw(), wake.raw(), idle_timeout) {
+            Ok(event) => event,
+            Err(error) => break Err(error),
+        };
+        let (slot, response) = match event {
+            PipeEvent::Stop => break Ok(()),
+            PipeEvent::Idle if COMMITTING.load(Ordering::SeqCst) || preparing.is_some() => continue,
+            PipeEvent::Idle => break Ok(()),
+            PipeEvent::Wake => {
+                let Some(in_flight) = preparing.take() else {
+                    continue;
+                };
+                let outcome = match in_flight.receiver.try_recv() {
+                    Err(TryRecvError::Empty) => {
+                        preparing = Some(in_flight);
+                        continue;
+                    }
+                    Ok(outcome) => outcome,
+                    Err(TryRecvError::Disconnected) => Err(MaintenanceError::new(
+                        ErrorCode::TransactionState,
+                        "prepare worker ended without a result",
+                    )),
+                };
+                let _ = in_flight.worker.join();
+                (
+                    in_flight.slot,
+                    outcome.and_then(|prepared| finish_prepare(&mut state, prepared)),
+                )
+            }
+            PipeEvent::Request { slot, message } => {
+                let Some(pipe) = server.pipe(slot) else {
+                    break Err(MaintenanceError::new(
+                        ErrorCode::TransactionState,
+                        "pipe instance of the request is not held",
+                    ));
+                };
+                let dispatch = message
+                    .and_then(|bytes| crate::protocol::decode_request(&bytes))
+                    .and_then(|request| {
+                        process_request(pipe, request, &mut state, preparing.is_some())
+                    });
+                match dispatch {
+                    Ok(Dispatch::Respond(value)) => (slot, Ok(value)),
+                    Ok(Dispatch::Prepare(work)) => match spawn_prepare(pipe, work, wake.raw()) {
+                        Ok((receiver, worker)) => {
+                            preparing = Some(PrepareInFlight {
+                                slot,
+                                receiver,
+                                worker,
+                            });
+                            continue;
+                        }
+                        Err(error) => (slot, Err(error)),
+                    },
+                    Err(error) => (slot, Err(error)),
+                }
+            }
+        };
+        if let Err(error) = respond(&mut server, slot, response) {
+            break Err(error);
+        }
+    };
+    if let Some(in_flight) = preparing.take() {
+        // The worker impersonates through its instance's pipe handle, which closes with the server.
+        let _ = in_flight.worker.join();
     }
-
-    CURRENT_PIPE.store(ptr::null_mut(), Ordering::SeqCst);
+    drop(server);
     STOP_EVENT.store(ptr::null_mut(), Ordering::SeqCst);
-    Ok(())
+    result
+}
+
+/// Writes one JSON response, or drops a connection whose response cannot be encoded in bounds.
+fn respond(
+    server: &mut PipeServer,
+    slot: usize,
+    response: Result<serde_json::Value>,
+) -> Result<()> {
+    let value = response.unwrap_or_else(|error| maintenance_error_response(&error));
+    match serde_json::to_vec(&value) {
+        // A client that disconnected or stopped reading only loses its own response.
+        Ok(encoded) if encoded.len() <= MAX_IPC_MESSAGE_BYTES => {
+            server.respond(slot, &encoded).map(|_| ())
+        }
+        _ => server.release(slot),
+    }
+}
+
+/// Result of request processing on the service thread.
+enum Dispatch {
+    Respond(serde_json::Value),
+    /// A verified PrepareFileSet request whose staging, signature, and hashing work runs on a
+    /// worker thread while the service keeps answering status requests.
+    Prepare(Box<PrepareWork>),
+}
+
+struct PrepareWork {
+    manifest: crate::VerifiedFileSet,
+    root: RegisteredRoot,
+    staging_path: PathBuf,
+    owner_sid: String,
+    data_directory: PathBuf,
+    authenticode_signer_thumbprints: Vec<String>,
+}
+
+struct PreparedOutcome {
+    prepared: PreparedJob,
+    root_id: String,
+    record: GenerationRecord,
+    owner_sid: String,
+}
+
+struct PrepareInFlight {
+    slot: usize,
+    receiver: Receiver<Result<PreparedOutcome>>,
+    worker: thread::JoinHandle<()>,
+}
+
+type PrepareChannel = (Receiver<Result<PreparedOutcome>>, thread::JoinHandle<()>);
+
+fn spawn_prepare(pipe: HANDLE, work: Box<PrepareWork>, wake: HANDLE) -> Result<PrepareChannel> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let pipe = SendHandle(pipe);
+    let wake = SendHandle(wake);
+    let worker = thread::Builder::new()
+        .name("7launcher-maintenance-prepare".to_owned())
+        .spawn(move || {
+            let (pipe, wake) = (pipe, wake);
+            let _ = sender.send(run_prepare(pipe.0, *work));
+            // SAFETY: the service loop owns this event and joins the worker before closing it.
+            let _ = unsafe { SetEvent(wake.0) };
+        })
+        .map_err(|_| {
+            MaintenanceError::new(
+                ErrorCode::TransactionState,
+                "prepare worker cannot be started",
+            )
+        })?;
+    Ok((receiver, worker))
+}
+
+/// Opens the staging payloads as the caller and prepares the transaction. Runs on the prepare
+/// worker; the pipe instance stays held, so impersonation through it remains valid.
+fn run_prepare(pipe: HANDLE, work: PrepareWork) -> Result<PreparedOutcome> {
+    let files = &work.manifest.file_set().files;
+    let (staging_caller, platform) = preopen_staging_as_caller(pipe, &work.staging_path, files)?;
+    if staging_caller.sid() != work.owner_sid {
+        return Err(MaintenanceError::new(
+            ErrorCode::RootUnauthorized,
+            "caller token changed while opening staging handles",
+        ));
+    }
+    if work.root.root_kind() == crate::protocol::RootKind::Launcher {
+        platform.verify_launcher_payloads(files, &work.authenticode_signer_thumbprints)?;
+    }
+    let policy = TransactionPolicy::new(&work.data_directory, Arc::new(platform))?;
+    let prepared = prepare_file_set(&work.manifest, &work.root, &work.staging_path, policy)?;
+    Ok(PreparedOutcome {
+        prepared,
+        root_id: work.root.root_id().to_owned(),
+        record: GenerationRecord {
+            generation: work.manifest.file_set().generation,
+            digest: work.manifest.digest(),
+        },
+        owner_sid: work.owner_sid,
+    })
+}
+
+fn finish_prepare(state: &mut ServiceState, outcome: PreparedOutcome) -> Result<serde_json::Value> {
+    let job_id = outcome.prepared.job_id().to_owned();
+    state.generations.accept(&outcome.root_id, outcome.record)?;
+    state.generations.save(&state.generation_path)?;
+    state.active_job = Some(ActiveJob {
+        job_id: job_id.clone(),
+        owner_sid: outcome.owner_sid,
+        state: ActiveJobState::Prepared(Box::new(outcome.prepared)),
+    });
+    Ok(serde_json::json!({
+        "jobId": job_id,
+        "ok": true,
+        "protocolMajor": crate::protocol::PROTOCOL_MAJOR,
+        "state": "prepared",
+    }))
 }
 
 fn maintenance_error_response(error: &MaintenanceError) -> serde_json::Value {
@@ -3225,7 +3372,22 @@ fn process_request(
     pipe: HANDLE,
     request: Request,
     state: &mut ServiceState,
-) -> Result<serde_json::Value> {
+    preparing: bool,
+) -> Result<Dispatch> {
+    if preparing
+        && !matches!(
+            request,
+            Request::GetStatus { .. }
+                | Request::GetRootStatus { .. }
+                | Request::GetRegistryScopeStatus { .. }
+                | Request::GetJobStatus { .. }
+        )
+    {
+        return Err(MaintenanceError::new(
+            ErrorCode::ServiceBusy,
+            "another maintenance job is being prepared",
+        ));
+    }
     refresh_active_job(state);
     let caller = caller_identity_from_connected_pipe(pipe)?;
     let active_owner = state
@@ -3239,7 +3401,7 @@ fn process_request(
         &state.registry_scopes,
         active_owner,
     )?;
-    match (request, authorization) {
+    let response = match (request, authorization) {
         (Request::GetStatus { .. }, AuthorizedRequest::GetStatus) => Ok(serde_json::json!({
             "capabilities": [
                 "file-set-v1",
@@ -3476,45 +3638,17 @@ fn process_request(
                     previous: state.generations.previous(root.root_id())?,
                 },
             )?;
-            let (staging_caller, platform) = preopen_staging_as_caller(
-                pipe,
-                Path::new(&staging_path),
-                &manifest.file_set().files,
-            )?;
-            if staging_caller.sid() != caller.sid() {
-                return Err(MaintenanceError::new(
-                    ErrorCode::RootUnauthorized,
-                    "caller token changed while opening staging handles",
-                ));
-            }
-            if root.root_kind() == crate::protocol::RootKind::Launcher {
-                platform.verify_launcher_payloads(
-                    &manifest.file_set().files,
-                    &keyring.keyring().authenticode_signer_thumbprints,
-                )?;
-            }
-            let policy = TransactionPolicy::new(&state.data_directory, Arc::new(platform))?;
-            let prepared = prepare_file_set(&manifest, &root, Path::new(&staging_path), policy)?;
-            let job_id = prepared.job_id().to_owned();
-            state.generations.accept(
-                root.root_id(),
-                GenerationRecord {
-                    generation: manifest.file_set().generation,
-                    digest: manifest.digest(),
-                },
-            )?;
-            state.generations.save(&state.generation_path)?;
-            state.active_job = Some(ActiveJob {
-                job_id: job_id.clone(),
+            return Ok(Dispatch::Prepare(Box::new(PrepareWork {
+                authenticode_signer_thumbprints: keyring
+                    .keyring()
+                    .authenticode_signer_thumbprints
+                    .clone(),
+                data_directory: state.data_directory.clone(),
+                manifest,
                 owner_sid: caller.sid().to_owned(),
-                state: ActiveJobState::Prepared(Box::new(prepared)),
-            });
-            Ok(serde_json::json!({
-                "jobId": job_id,
-                "ok": true,
-                "protocolMajor": crate::protocol::PROTOCOL_MAJOR,
-                "state": "prepared",
-            }))
+                root,
+                staging_path: PathBuf::from(staging_path),
+            })));
         }
         (
             Request::CommitJob { job_id, .. },
@@ -3614,7 +3748,8 @@ fn process_request(
             ErrorCode::ProtocolInvalid,
             "request and authorization decision did not match",
         )),
-    }
+    };
+    response.map(Dispatch::Respond)
 }
 
 fn apply_registry_set_transaction(
@@ -3815,148 +3950,6 @@ fn create_event(manual_reset: bool, initial_state: bool) -> Result<KernelHandle>
         ErrorCode::TransactionIo,
         "service event handle is invalid",
     )
-}
-
-fn connect_pipe_or_stop(pipe: HANDLE, stop_event: HANDLE) -> Result<bool> {
-    let connect_event = create_event(true, false)?;
-    let mut overlapped = OVERLAPPED {
-        hEvent: connect_event.raw(),
-        ..Default::default()
-    };
-    // SAFETY: the pipe was opened for overlapped I/O and `overlapped` plus its event remain live
-    // until completion/cancellation is observed below.
-    match unsafe { ConnectNamedPipe(pipe, Some(&mut overlapped)) } {
-        Ok(()) => Ok(true),
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => Ok(true),
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
-            // SAFETY: both handles are live waitable event handles for the whole call.
-            let wait = unsafe {
-                WaitForMultipleObjects(
-                    &[connect_event.raw(), stop_event],
-                    false,
-                    SERVICE_IDLE_TIMEOUT_MS,
-                )
-            };
-            if wait == WAIT_OBJECT_0 {
-                let mut transferred = 0_u32;
-                // SAFETY: the matching OVERLAPPED remains live and the event signaled completion.
-                unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, false) }
-                    .map_err(|_| {
-                        MaintenanceError::new(
-                            ErrorCode::TransactionIo,
-                            "named-pipe connection did not complete",
-                        )
-                    })?;
-                Ok(true)
-            } else if wait.0 == WAIT_OBJECT_0.0 + 1 || wait == WAIT_TIMEOUT {
-                // SAFETY: cancellation targets this live connect operation and is observed before
-                // `overlapped` leaves scope.
-                let _ = unsafe { CancelIoEx(pipe, Some(&overlapped)) };
-                let mut transferred = 0_u32;
-                // SAFETY: waiting here drains completion/cancellation before stack storage drops.
-                let _ = unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, true) };
-                Ok(false)
-            } else {
-                Err(MaintenanceError::new(
-                    ErrorCode::TransactionIo,
-                    "named-pipe connection wait failed",
-                ))
-            }
-        }
-        Err(_) => Err(MaintenanceError::new(
-            ErrorCode::TransactionIo,
-            "named-pipe connection failed",
-        )),
-    }
-}
-
-fn read_pipe_message(pipe: HANDLE) -> Result<Vec<u8>> {
-    let event = create_event(true, false)?;
-    let mut overlapped = OVERLAPPED {
-        hEvent: event.raw(),
-        ..Default::default()
-    };
-    let mut bytes = vec![0_u8; MAX_IPC_MESSAGE_BYTES];
-    let mut transferred = 0_u32;
-    // SAFETY: the pipe is connected and opened overlapped; buffer, count, OVERLAPPED, and event all
-    // remain live until completion is observed.
-    match unsafe {
-        ReadFile(
-            pipe,
-            Some(&mut bytes),
-            Some(&mut transferred),
-            Some(&mut overlapped),
-        )
-    } {
-        Ok(()) => {}
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
-            // SAFETY: this waits for the matching live OVERLAPPED before its storage is released.
-            unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, true) }.map_err(
-                |_| {
-                    MaintenanceError::new(
-                        ErrorCode::ProtocolInvalid,
-                        "IPC request read did not complete",
-                    )
-                },
-            )?;
-        }
-        Err(_) => {
-            return Err(MaintenanceError::new(
-                ErrorCode::ProtocolInvalid,
-                "IPC request could not be read as one bounded message",
-            ));
-        }
-    }
-    let transferred = usize::try_from(transferred).map_err(|_| {
-        MaintenanceError::new(ErrorCode::ProtocolTooLarge, "IPC request size overflowed")
-    })?;
-    bytes.truncate(transferred);
-    Ok(bytes)
-}
-
-fn write_pipe_message(pipe: HANDLE, bytes: &[u8]) -> Result<()> {
-    let event = create_event(true, false)?;
-    let mut overlapped = OVERLAPPED {
-        hEvent: event.raw(),
-        ..Default::default()
-    };
-    let mut transferred = 0_u32;
-    // SAFETY: the pipe is connected and opened overlapped; the response bytes and OVERLAPPED remain
-    // live until completion is observed.
-    match unsafe {
-        WriteFile(
-            pipe,
-            Some(bytes),
-            Some(&mut transferred),
-            Some(&mut overlapped),
-        )
-    } {
-        Ok(()) => {}
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
-            // SAFETY: this waits for the matching live OVERLAPPED before its storage is released.
-            unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, true) }.map_err(
-                |_| {
-                    MaintenanceError::new(
-                        ErrorCode::TransactionIo,
-                        "IPC response write did not complete",
-                    )
-                },
-            )?;
-        }
-        Err(_) => {
-            return Err(MaintenanceError::new(
-                ErrorCode::TransactionIo,
-                "IPC response could not be written",
-            ));
-        }
-    }
-    if usize::try_from(transferred).ok() != Some(bytes.len()) {
-        return Err(MaintenanceError::new(
-            ErrorCode::TransactionIo,
-            "IPC response write was incomplete",
-        ));
-    }
-    Ok(())
 }
 
 fn report_status(
@@ -4393,6 +4386,14 @@ mod pipe_wait_tests {
 #[cfg(test)]
 mod pipe_transaction_tests {
     use std::time::SystemTime;
+
+    use windows::Win32::{
+        Foundation::ERROR_PIPE_CONNECTED,
+        Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile},
+        System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+        },
+    };
 
     use super::*;
 

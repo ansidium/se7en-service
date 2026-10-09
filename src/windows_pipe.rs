@@ -1,3 +1,6 @@
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! Local named-pipe transport of the maintenance service.
 //!
 //! The server keeps several overlapped instances of its pipe listening at all times, so the name

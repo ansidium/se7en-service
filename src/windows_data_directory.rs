@@ -1,3 +1,6 @@
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! Protected service data directory and the trusted system folders it is derived from.
 //!
 //! `%ProgramData%` lets every user create subdirectories, so `SE7EN\Service` may already exist

@@ -1474,7 +1474,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
         let file = match retained {
             Some(file) => file,
             None => match open_relative_file(
-                root.canonical_path(),
+                root,
                 relative_path,
                 FILE_READ_ATTRIBUTES.0 | DELETE.0,
                 false,
@@ -1504,7 +1504,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
     ) -> Result<()> {
         let relative = prepared_relative_path(job_id, index);
         let mut destination = open_relative_file(
-            root.canonical_path(),
+            root,
             &relative,
             FILE_WRITE_DATA.0 | FILE_READ_ATTRIBUTES.0 | DELETE.0,
             true,
@@ -1593,12 +1593,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
                 "target handle changed before backup rename",
             ));
         }
-        rename_handle_relative(
-            root.canonical_path(),
-            &file,
-            &backup_relative_path(job_id, index),
-            true,
-        )
+        rename_handle_relative(root, &file, &backup_relative_path(job_id, index), true)
     }
 
     fn rename_prepared_to_target(
@@ -1615,7 +1610,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
             ));
         }
         let prepared = open_relative_file(
-            root.canonical_path(),
+            root,
             &prepared_relative_path(job_id, index),
             FILE_READ_ATTRIBUTES.0 | DELETE.0,
             false,
@@ -1628,12 +1623,12 @@ impl TransactionPlatform for WindowsTransactionPlatform {
             )
         })?;
         regular_file_snapshot(&prepared)?;
-        rename_handle_relative(root.canonical_path(), &prepared, relative_path, true)
+        rename_handle_relative(root, &prepared, relative_path, true)
     }
 
     fn backup_exists(&self, root: &RegisteredRoot, job_id: &str, index: u32) -> Result<bool> {
         Ok(open_relative_file(
-            root.canonical_path(),
+            root,
             &backup_relative_path(job_id, index),
             FILE_READ_ATTRIBUTES.0,
             false,
@@ -1657,7 +1652,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
             Some(file) => file,
             None => {
                 let Some(file) = open_relative_file(
-                    root.canonical_path(),
+                    root,
                     relative_path,
                     FILE_READ_ATTRIBUTES.0 | DELETE.0,
                     false,
@@ -1687,7 +1682,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
             ));
         }
         let backup = open_relative_file(
-            root.canonical_path(),
+            root,
             &backup_relative_path(job_id, index),
             FILE_READ_ATTRIBUTES.0 | DELETE.0,
             false,
@@ -1700,7 +1695,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
             )
         })?;
         regular_file_snapshot(&backup)?;
-        rename_handle_relative(root.canonical_path(), &backup, relative_path, true)
+        rename_handle_relative(root, &backup, relative_path, true)
     }
 
     fn cleanup_job(
@@ -1709,7 +1704,7 @@ impl TransactionPlatform for WindowsTransactionPlatform {
         job_id: &str,
         private_job_directory: &Path,
     ) -> Result<()> {
-        cleanup_reserved_job(root.canonical_path(), job_id)?;
+        cleanup_reserved_job(root, job_id)?;
         if private_job_directory.exists() {
             fs::remove_dir_all(private_job_directory).map_err(|_| {
                 MaintenanceError::new(
@@ -1741,8 +1736,41 @@ fn open_absolute_directory(path: &Path, delete_access: bool) -> Result<File> {
     Ok(file)
 }
 
-fn open_relative_file(
-    root: &Path,
+/// The directory that relative file operations start from. A registered root also carries the
+/// identity captured at registration: every operation compares it with the handle it opens, so a
+/// directory or junction that takes the root's path after verification is refused.
+#[derive(Clone, Copy)]
+struct RootLocation<'a> {
+    path: &'a Path,
+    identity: Option<DirectoryIdentity>,
+}
+
+impl<'a> From<&'a Path> for RootLocation<'a> {
+    fn from(path: &'a Path) -> Self {
+        Self {
+            path,
+            identity: None,
+        }
+    }
+}
+
+impl<'a> From<&'a PathBuf> for RootLocation<'a> {
+    fn from(path: &'a PathBuf) -> Self {
+        Self::from(path.as_path())
+    }
+}
+
+impl<'a> From<&'a RegisteredRoot> for RootLocation<'a> {
+    fn from(root: &'a RegisteredRoot) -> Self {
+        Self {
+            path: root.canonical_path(),
+            identity: Some(root.identity()),
+        }
+    }
+}
+
+fn open_relative_file<'a>(
+    root: impl Into<RootLocation<'a>>,
     relative_path: &str,
     desired_access: u32,
     create_new: bool,
@@ -1783,13 +1811,24 @@ fn open_relative_file(
     Ok(Some(file))
 }
 
-fn lock_parent_chain(
-    root: &Path,
+fn lock_parent_chain<'a>(
+    root: impl Into<RootLocation<'a>>,
     parents: &[String],
     create_missing: bool,
 ) -> Result<Option<(Vec<File>, PathBuf)>> {
-    let mut locks = vec![open_absolute_directory(root, false)?];
-    let mut current = root.to_path_buf();
+    let root = root.into();
+    let root_handle = open_absolute_directory(root.path, false)?;
+    if let Some(identity) = root.identity
+        && (directory_identity(&root_handle)? != identity
+            || final_path_owned(&root_handle)? != root.path)
+    {
+        return Err(MaintenanceError::new(
+            ErrorCode::RootIdentity,
+            "registered root handle identity or canonical path changed",
+        ));
+    }
+    let mut locks = vec![root_handle];
+    let mut current = root.path.to_path_buf();
     for component in parents {
         current.push(component);
         let opened = open_absolute(
@@ -2026,8 +2065,8 @@ pub fn write_new_diagnostic_file(directory: &Path, name: &str, contents: &[u8]) 
     })
 }
 
-fn rename_handle_relative(
-    root: &Path,
+fn rename_handle_relative<'a>(
+    root: impl Into<RootLocation<'a>>,
     file: &File,
     destination: &str,
     create_parents: bool,
@@ -2128,10 +2167,13 @@ fn delete_by_handle(file: &File) -> Result<()> {
     })
 }
 
-fn cleanup_reserved_job(root: &Path, job_id: &str) -> Result<()> {
+fn cleanup_reserved_job<'a>(root: impl Into<RootLocation<'a>>, job_id: &str) -> Result<()> {
+    let root = root.into();
+    // Holding the verified root keeps it from being renamed while its job entries are removed.
+    let _root_lock = lock_parent_chain(root, &[], false)?;
     for leaf in ["prepared", "backup"] {
         let relative = format!(".7launcher-maintenance/jobs/{job_id}/{leaf}");
-        let directory_path = root.join(relative.replace('/', "\\"));
+        let directory_path = root.path.join(relative.replace('/', "\\"));
         let entries = match fs::read_dir(&directory_path) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2182,7 +2224,7 @@ fn cleanup_reserved_job(root: &Path, job_id: &str) -> Result<()> {
         ".7launcher-maintenance/jobs".to_owned(),
         ".7launcher-maintenance".to_owned(),
     ] {
-        let path = root.join(relative.replace('/', "\\"));
+        let path = root.path.join(relative.replace('/', "\\"));
         match fs::remove_dir(path) {
             Ok(()) => {}
             Err(error)
@@ -5573,6 +5615,64 @@ mod windows_transaction_e2e_tests {
         platform
             .cleanup_job(&root, "e2e-job", &directory.0.join("private-job"))
             .expect("clean reserved transaction state");
+    }
+
+    #[test]
+    fn a_root_replaced_after_verification_is_refused_by_file_operations() {
+        let directory = TempDirectory::create();
+        let root_path = directory.0.join("root");
+        let private_payload = directory.0.join("payload.bin");
+        fs::create_dir(&root_path).expect("create root");
+        fs::write(&private_payload, b"new").expect("write private payload");
+        let root_handle = open_absolute_directory(&root_path, false).expect("open root");
+        let root = RegisteredRoot::from_canonical_identity(
+            "swap-root",
+            "swap-product",
+            crate::protocol::RootKind::Game,
+            final_path_owned(&root_handle)
+                .expect("canonical root")
+                .to_string_lossy(),
+            directory_identity(&root_handle).expect("root identity"),
+            "S-1-5-21-1000",
+        )
+        .expect("registered root");
+        drop(root_handle);
+        let platform = WindowsTransactionPlatform::default();
+        platform.verify_root_identity(&root).expect("verified root");
+
+        // Another directory takes the registered path after verification.
+        fs::rename(&root_path, directory.0.join("moved")).expect("move registered root");
+        fs::create_dir(&root_path).expect("create replacement");
+        fs::write(root_path.join("target.txt"), b"replacement").expect("write replacement");
+
+        let expected = FileEntry {
+            path: "target.txt".to_owned(),
+            sha256: encode_lower_hex(&crate::sha256(b"new")),
+            size: 3,
+        };
+        let inspected = platform.inspect_target(&root, "target.txt");
+        assert_eq!(
+            inspected.expect_err("inspect must refuse").code(),
+            ErrorCode::RootIdentity
+        );
+        let prepared =
+            platform.prepare_target_payload(&root, "swap-job", 0, &private_payload, &expected);
+        assert_eq!(
+            prepared.expect_err("prepare must refuse").code(),
+            ErrorCode::RootIdentity
+        );
+        assert!(!root_path.join(".7launcher-maintenance").exists());
+        assert_eq!(
+            platform
+                .delete_target(&root, "target.txt")
+                .expect_err("delete must refuse")
+                .code(),
+            ErrorCode::RootIdentity
+        );
+        assert_eq!(
+            fs::read(root_path.join("target.txt")).unwrap(),
+            b"replacement"
+        );
     }
 }
 

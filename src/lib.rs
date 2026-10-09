@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod registry_scopes;
 pub mod registry_set;
 pub mod roots;
+pub mod service_log;
 pub mod service_upgrade;
 pub mod transaction;
 pub mod trust;

@@ -76,6 +76,9 @@ use windows::{
             OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
         },
         System::{
+            EventLog::{
+                DeregisterEventSource, EVENTLOG_ERROR_TYPE, RegisterEventSourceW, ReportEventW,
+            },
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
             Pipes::{
                 ImpersonateNamedPipeClient, PIPE_READMODE_MESSAGE, SetNamedPipeHandleState,
@@ -121,6 +124,7 @@ use crate::{
     protocol::Request,
     registry_scopes::{RegisteredRegistryScope, RegistryScopeRegistry, validate_registry_subkey},
     roots::{DirectoryIdentity, RegisteredRoot, RootRegistry},
+    service_log::ServiceLog,
     transaction::{
         CommitResult, PreparedJob, TargetSnapshot, TransactionPlatform, TransactionPolicy,
         commit_file_set, prepare_file_set, recover_incomplete_with_policy,
@@ -3221,11 +3225,53 @@ fn service_loop() -> Result<()> {
     COMMITTING.store(false, Ordering::SeqCst);
     let stop_event = create_event(true, false)?;
     STOP_EVENT.store(stop_event.raw().0, Ordering::SeqCst);
+    let wake = create_event(false, false)?;
 
+    let result = match load_service_state() {
+        Ok((data_handle, state)) => {
+            let log = ServiceLog::in_directory(data_handle.path());
+            let result = serve_requests(&stop_event, &wake, state, &log);
+            match &result {
+                Ok(()) => log.record("service-stop", "stopped"),
+                Err(error) => log.record_error("service-stop", error),
+            }
+            result
+        }
+        Err(error) => {
+            report_service_event(&format!(
+                "SE7EN Service cannot use its protected state and answers every request with \
+                 this error until it is resolved: {error}"
+            ));
+            serve_startup_failure(&stop_event, &wake, &error);
+            Err(error)
+        }
+    };
+    STOP_EVENT.store(ptr::null_mut(), Ordering::SeqCst);
+    result
+}
+
+/// Opens and verifies the protected state, then recovers interrupted transactions.
+fn load_service_state() -> Result<(data_directory::ProtectedDataDirectory, ServiceState)> {
     // Setup creates this directory with an administrator owner and a protected DACL. The service
     // never recreates a missing directory and refuses one that a non-administrator could change.
     let data_handle = open_service_data_directory()?;
     let data_directory = data_handle.path().to_path_buf();
+    let log = ServiceLog::in_directory(&data_directory);
+    log.record(
+        "service-start",
+        &format!(
+            "version {} process {}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
+    );
+    let state = recover_service_state(data_directory, &log).inspect_err(|error| {
+        log.record_error("service-start-failed", error);
+    })?;
+    Ok((data_handle, state))
+}
+
+fn recover_service_state(data_directory: PathBuf, log: &ServiceLog) -> Result<ServiceState> {
     let registry_path = data_directory.join("roots-v1.json");
     let roots = if registry_path.exists() {
         RootRegistry::load(&registry_path)?
@@ -3249,6 +3295,15 @@ fn service_loop() -> Result<()> {
         Arc::new(WindowsTransactionPlatform::default()),
     )?;
     let recovery = recover_incomplete_with_policy(recovery_policy)?;
+    for (outcome, jobs) in [
+        ("committed", &recovery.committed_jobs),
+        ("rolled back", &recovery.rolled_back_jobs),
+        ("discarded", &recovery.discarded_prepared_jobs),
+    ] {
+        for job_id in jobs {
+            log.record("recovery", &format!("{outcome} {job_id}"));
+        }
+    }
     let mut recovered_generation = false;
     for job_id in recovery.committed_jobs {
         if let Some((root_id, record)) = generation_from_job_id(&job_id) {
@@ -3259,7 +3314,7 @@ fn service_loop() -> Result<()> {
     if recovered_generation {
         generations.save(&generation_path)?;
     }
-    let mut state = ServiceState {
+    Ok(ServiceState {
         generation_path,
         generations,
         keyring_path: data_directory.join("keyring-v1.json"),
@@ -3272,19 +3327,52 @@ fn service_loop() -> Result<()> {
         registry_scopes,
         registry_transaction_path,
         active_job: None,
-    };
+    })
+}
 
-    // Claim the pipe name before reporting Running: a client that sees Running must find this
-    // process's instances, and a name that another process already holds stops the service.
-    let mut server = PipeServer::create(
+/// Claims the pipe name before reporting Running: a client that sees Running must find this
+/// process's instances, and a name that another process already holds stops the service.
+fn start_pipe_server() -> Result<PipeServer> {
+    let server = PipeServer::create(
         PIPE_NAME,
         SERVICE_PIPE_INSTANCES,
         SERVICE_PIPE_READ_TIMEOUT,
         SERVICE_PIPE_WRITE_TIMEOUT,
     )?;
-    let wake = create_event(false, false)?;
     report_status(SERVICE_RUNNING, true, 0)?;
-    let idle_timeout = Duration::from_millis(u64::from(SERVICE_IDLE_TIMEOUT_MS));
+    Ok(server)
+}
+
+fn idle_timeout() -> Duration {
+    Duration::from_millis(u64::from(SERVICE_IDLE_TIMEOUT_MS))
+}
+
+/// Keeps the service reachable after its state could not be loaded, so that clients and the
+/// installer receive the actual reason instead of a pipe timeout. No request touches any state.
+fn serve_startup_failure(stop_event: &KernelHandle, wake: &KernelHandle, error: &MaintenanceError) {
+    let Ok(mut server) = start_pipe_server() else {
+        return;
+    };
+    while let Ok(event) = server.next_event(stop_event.raw(), wake.raw(), idle_timeout()) {
+        match event {
+            PipeEvent::Request { slot, .. } => {
+                if respond(&mut server, slot, Err(error.clone())).is_err() {
+                    return;
+                }
+            }
+            PipeEvent::Wake => {}
+            PipeEvent::Stop | PipeEvent::Idle => return,
+        }
+    }
+}
+
+fn serve_requests(
+    stop_event: &KernelHandle,
+    wake: &KernelHandle,
+    mut state: ServiceState,
+    log: &ServiceLog,
+) -> Result<()> {
+    let mut server = start_pipe_server()?;
     let mut preparing: Option<PrepareInFlight> = None;
     let result = loop {
         // A commit ends with the stop event when a stop was requested meanwhile; until then the
@@ -3295,11 +3383,11 @@ fn service_loop() -> Result<()> {
         {
             break Ok(());
         }
-        let event = match server.next_event(stop_event.raw(), wake.raw(), idle_timeout) {
+        let event = match server.next_event(stop_event.raw(), wake.raw(), idle_timeout()) {
             Ok(event) => event,
             Err(error) => break Err(error),
         };
-        let (slot, response) = match event {
+        let (slot, kind, response) = match event {
             PipeEvent::Stop => break Ok(()),
             PipeEvent::Idle if COMMITTING.load(Ordering::SeqCst) || preparing.is_some() => continue,
             PipeEvent::Idle => break Ok(()),
@@ -3321,6 +3409,7 @@ fn service_loop() -> Result<()> {
                 let _ = in_flight.worker.join();
                 (
                     in_flight.slot,
+                    RequestKind::Mutation("prepare"),
                     outcome.and_then(|prepared| finish_prepare(&mut state, prepared)),
                 )
             }
@@ -3331,13 +3420,15 @@ fn service_loop() -> Result<()> {
                         "pipe instance of the request is not held",
                     ));
                 };
-                let dispatch = message
-                    .and_then(|bytes| crate::protocol::decode_request(&bytes))
-                    .and_then(|request| {
-                        process_request(pipe, request, &mut state, preparing.is_some())
-                    });
+                let request = message.and_then(|bytes| crate::protocol::decode_request(&bytes));
+                let kind = request
+                    .as_ref()
+                    .map_or(RequestKind::Query("invalid"), request_kind);
+                let dispatch = request.and_then(|request| {
+                    process_request(pipe, request, &mut state, preparing.is_some())
+                });
                 match dispatch {
-                    Ok(Dispatch::Respond(value)) => (slot, Ok(value)),
+                    Ok(Dispatch::Respond(value)) => (slot, kind, Ok(value)),
                     Ok(Dispatch::Prepare(work)) => match spawn_prepare(pipe, work, wake.raw()) {
                         Ok((receiver, worker)) => {
                             preparing = Some(PrepareInFlight {
@@ -3347,12 +3438,19 @@ fn service_loop() -> Result<()> {
                             });
                             continue;
                         }
-                        Err(error) => (slot, Err(error)),
+                        Err(error) => (slot, kind, Err(error)),
                     },
-                    Err(error) => (slot, Err(error)),
+                    Err(error) => (slot, kind, Err(error)),
                 }
             }
         };
+        match (&response, kind) {
+            (Err(error), RequestKind::Query(name) | RequestKind::Mutation(name)) => {
+                log.record_error(&format!("{name}-failed"), error);
+            }
+            (Ok(value), RequestKind::Mutation(name)) => log.record(name, &mutation_summary(value)),
+            (Ok(_), RequestKind::Query(_)) => {}
+        }
         if let Err(error) = respond(&mut server, slot, response) {
             break Err(error);
         }
@@ -3362,8 +3460,68 @@ fn service_loop() -> Result<()> {
         let _ = in_flight.worker.join();
     }
     drop(server);
-    STOP_EVENT.store(ptr::null_mut(), Ordering::SeqCst);
     result
+}
+
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Query(&'static str),
+    Mutation(&'static str),
+}
+
+fn request_kind(request: &Request) -> RequestKind {
+    match request {
+        Request::GetStatus { .. } => RequestKind::Query("status"),
+        Request::GetRootStatus { .. } => RequestKind::Query("root-status"),
+        Request::GetRegistryScopeStatus { .. } => RequestKind::Query("registry-scope-status"),
+        Request::GetJobStatus { .. } => RequestKind::Query("job-status"),
+        Request::RegisterRoot { .. } => RequestKind::Mutation("register-root"),
+        Request::UnregisterRoot { .. } => RequestKind::Mutation("unregister-root"),
+        Request::RegisterRegistryScope { .. } => RequestKind::Mutation("register-registry-scope"),
+        Request::UnregisterRegistryScope { .. } => {
+            RequestKind::Mutation("unregister-registry-scope")
+        }
+        Request::ApplyRegistrySet { .. } => RequestKind::Mutation("apply-registry-set"),
+        Request::PrepareFileSet { .. } => RequestKind::Mutation("prepare"),
+        Request::CommitJob { .. } => RequestKind::Mutation("commit"),
+    }
+}
+
+/// Identifiers of a successful mutation, never paths or payloads.
+fn mutation_summary(response: &serde_json::Value) -> String {
+    ["rootId", "scopeId", "jobId", "state", "generation"]
+        .iter()
+        .filter_map(|key| response.get(key).map(|value| format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reports a startup failure to the Application event log. This is the only record when the
+/// protected data directory itself cannot be trusted.
+fn report_service_event(message: &str) {
+    let source = wide_null(SERVICE_NAME);
+    // SAFETY: the source name is NUL-terminated; a returned handle is deregistered below.
+    let Ok(log) = (unsafe { RegisterEventSourceW(PCWSTR::null(), PCWSTR(source.as_ptr())) }) else {
+        return;
+    };
+    let text = wide_null(message);
+    let strings = [PCWSTR(text.as_ptr())];
+    // SAFETY: the handle is a live event source and the single NUL-terminated string outlives
+    // the synchronous call.
+    let _ = unsafe {
+        ReportEventW(
+            log,
+            EVENTLOG_ERROR_TYPE,
+            0,
+            1,
+            None,
+            0,
+            Some(&strings),
+            None,
+        )
+    };
+    // SAFETY: the handle came from RegisterEventSourceW and is released exactly once.
+    let _ = unsafe { DeregisterEventSource(log) };
 }
 
 /// Writes one JSON response, or drops a connection whose response cannot be encoded in bounds.
@@ -3495,15 +3653,7 @@ fn process_request(
     state: &mut ServiceState,
     preparing: bool,
 ) -> Result<Dispatch> {
-    if preparing
-        && !matches!(
-            request,
-            Request::GetStatus { .. }
-                | Request::GetRootStatus { .. }
-                | Request::GetRegistryScopeStatus { .. }
-                | Request::GetJobStatus { .. }
-        )
-    {
+    if preparing && matches!(request_kind(&request), RequestKind::Mutation(_)) {
         return Err(MaintenanceError::new(
             ErrorCode::ServiceBusy,
             "another maintenance job is being prepared",
@@ -4281,6 +4431,26 @@ fn read_service_file(path: &Path, maximum: usize) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod service_log_tests {
+    use super::mutation_summary;
+
+    #[test]
+    fn mutation_records_name_identifiers_but_no_paths() {
+        let summary = mutation_summary(&serde_json::json!({
+            "jobId": "game-7-abc",
+            "ok": true,
+            "path": r"C:\Users\Example\Games",
+            "rootId": "game",
+            "state": "prepared",
+        }));
+        assert_eq!(
+            summary,
+            r#"rootId="game" jobId="game-7-abc" state="prepared""#
+        );
+    }
 }
 
 #[cfg(test)]

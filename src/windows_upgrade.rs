@@ -327,7 +327,7 @@ pub fn remove_system_service() -> Result<RemoveServiceResult> {
 }
 
 /// Removes everything the component owns besides its SCM entry: the Programs and Features entry,
-/// the service images, the manager copy and the release record.
+/// the service images, the manager copy and the protected state, release record first.
 ///
 /// The service is stopped or absent by the time this runs, so the images delete outright, and
 /// every step tolerates what is already gone.
@@ -337,7 +337,7 @@ fn remove_component_leftovers() -> Result<()> {
     delete_managed_file(MANAGED_CANDIDATE_RELATIVE_PATH)?;
     delete_managed_file(MANAGED_PREVIOUS_RELATIVE_PATH)?;
     remove_installed_manager();
-    remove_service_release_record()
+    remove_service_state()
 }
 
 /// Removes the manager copy the uninstall entry points at.
@@ -464,12 +464,14 @@ fn run_elevated_service_removal() -> Result<bool> {
     }
 }
 
-fn remove_service_release_record() -> Result<()> {
+fn remove_service_state() -> Result<()> {
     // A directory that fails the ownership check is not this component's state; leave it alone.
     let Ok(data_lock) = open_service_data_directory() else {
         return Ok(());
     };
-    let data_directory = data_lock.path();
+    let data_directory = data_lock.path().to_path_buf();
+    // The release record goes first: one left behind without an SCM entry refuses every later
+    // installation, while the remaining state only takes space.
     for file in [RELEASE_RECORD_FILE, UPGRADE_JOURNAL_FILE] {
         match std::fs::remove_file(data_directory.join(file)) {
             Ok(()) => {}
@@ -482,7 +484,107 @@ fn remove_service_release_record() -> Result<()> {
             }
         }
     }
+    // The verification handles share no delete access and would keep the directories in place.
+    drop(data_lock);
+    remove_state_directory(&data_directory)
+}
+
+/// Removes `directory` with its jobs, registrations, keyring and log, then its parent when that is
+/// left empty. Junctions and symbolic links inside are removed themselves, never followed.
+fn remove_state_directory(directory: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(MaintenanceError::new(
+                ErrorCode::TransactionIo,
+                "protected service state could not be removed",
+            ));
+        }
+    }
+    if let Some(parent) = directory.parent() {
+        // Succeeds only for an empty directory; anything else in SE7EN stays.
+        let _ = std::fs::remove_dir(parent);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_removal_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::remove_state_directory;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "se7en-service-state-removal-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create temp root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn all_state_is_removed_without_following_junctions() {
+        let root = TemporaryDirectory::new();
+        let outside = TemporaryDirectory::new();
+        fs::write(outside.0.join("game.dat"), b"user data").unwrap();
+        let parent = root.0.join("SE7EN");
+        let state = parent.join("Service");
+        fs::create_dir_all(state.join("jobs").join("game-1-abc")).unwrap();
+        for file in [
+            "roots-v1.json",
+            "keyring-v1.json",
+            "generations-v1.json",
+            "service-v1.log",
+        ] {
+            fs::write(state.join(file), b"{}").unwrap();
+        }
+        let linked = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(state.join("jobs").join("link"))
+            .arg(&outside.0)
+            .output()
+            .unwrap();
+        assert!(linked.status.success(), "create test junction");
+
+        remove_state_directory(&state).unwrap();
+        assert!(!state.exists());
+        assert!(!parent.exists(), "an empty SE7EN directory is removed too");
+        assert_eq!(fs::read(outside.0.join("game.dat")).unwrap(), b"user data");
+        // Removing again is a no-op.
+        remove_state_directory(&state).unwrap();
+    }
+
+    #[test]
+    fn other_content_of_the_parent_stays() {
+        let root = TemporaryDirectory::new();
+        let parent = root.0.join("SE7EN");
+        let state = parent.join("Service");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(parent.join("Other")).unwrap();
+        remove_state_directory(&state).unwrap();
+        assert!(!state.exists());
+        assert!(parent.join("Other").is_dir());
+    }
 }
 
 // The entry deliberately keeps the key the Inno wrapper used: a machine that installed the service

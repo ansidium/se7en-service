@@ -89,16 +89,19 @@ use windows::{
             },
             Services::{
                 ChangeServiceConfig2W, CloseServiceHandle, CreateServiceW, OpenSCManagerW,
-                OpenServiceW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW, SC_HANDLE,
-                SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO,
-                SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_CONFIG_DESCRIPTION,
-                SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
-                SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-                SERVICE_SID_INFO, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-                SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS,
-                SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
-                SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity, SetServiceStatus,
-                StartServiceCtrlDispatcherW, StartServiceW,
+                OpenServiceW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW, SC_ACTION,
+                SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
+                SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
+                SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS,
+                SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONFIG_SERVICE_SID_INFO,
+                SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW,
+                SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_STATUS,
+                SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING, SERVICE_SID_INFO,
+                SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
+                SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
+                SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+                SetServiceObjectSecurity, SetServiceStatus, StartServiceCtrlDispatcherW,
+                StartServiceW,
             },
             Threading::{
                 CreateEventW, EVENT_MODIFY_STATE, GetCurrentThread, OpenEventW, OpenProcess,
@@ -260,6 +263,23 @@ const DOMAIN_ALIAS_RID_ADMINS_VALUE: u32 = 0x0000_0220;
 const SECURITY_BUILTIN_DOMAIN_RID_VALUE: u32 = 0x0000_0020;
 // Defined by winsvc.h but omitted from the metadata shipped with windows 0.62.
 const SERVICE_SID_TYPE_NONE_VALUE: u32 = 0;
+/// The only privileges the LocalSystem process keeps: impersonating pipe clients and traversal.
+/// It starts no processes, takes no ownership, and uses no backup or restore semantics.
+pub const SERVICE_REQUIRED_PRIVILEGES: [&str; 2] =
+    ["SeChangeNotifyPrivilege", "SeImpersonatePrivilege"];
+/// SCM restarts a crashed service so that recovery of an interrupted transaction runs promptly. A
+/// service that stops with an error code is not restarted.
+pub const SERVICE_FAILURE_RESTART_DELAYS_MS: [u32; 2] = [5_000, 60_000];
+const SERVICE_FAILURE_RESET_SECONDS: u32 = 24 * 60 * 60;
+
+/// `REG_MULTI_SZ`-style list for SERVICE_REQUIRED_PRIVILEGES_INFOW.
+fn required_privileges_multi_string() -> Vec<u16> {
+    SERVICE_REQUIRED_PRIVILEGES
+        .iter()
+        .flat_map(|privilege| privilege.encode_utf16().chain(Some(0)))
+        .chain(Some(0))
+        .collect()
+}
 const SERVICE_IDLE_TIMEOUT_MS: u32 = 30_000;
 
 struct KernelHandle(HANDLE);
@@ -450,6 +470,53 @@ fn configure_system_service(service: &ServiceHandle) -> Result<()> {
         MaintenanceError::new(
             ErrorCode::RootUnauthorized,
             "service SID mode could not be configured",
+        )
+    })?;
+
+    let mut privileges = required_privileges_multi_string();
+    let required = SERVICE_REQUIRED_PRIVILEGES_INFOW {
+        pmszRequiredPrivileges: PWSTR(privileges.as_mut_ptr()),
+    };
+    // SAFETY: `required` has the exact layout required by SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO
+    // and its double-NUL-terminated backing buffer remains live through the synchronous call.
+    unsafe {
+        ChangeServiceConfig2W(
+            service.0,
+            SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO,
+            Some(ptr::from_ref(&required).cast()),
+        )
+    }
+    .map_err(|_| {
+        MaintenanceError::new(
+            ErrorCode::RootUnauthorized,
+            "service privileges could not be restricted",
+        )
+    })?;
+
+    let mut actions = SERVICE_FAILURE_RESTART_DELAYS_MS.map(|delay| SC_ACTION {
+        Type: SC_ACTION_RESTART,
+        Delay: delay,
+    });
+    let failure_actions = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: SERVICE_FAILURE_RESET_SECONDS,
+        lpRebootMsg: PWSTR::null(),
+        lpCommand: PWSTR::null(),
+        cActions: u32::try_from(actions.len()).unwrap_or(0),
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    // SAFETY: `failure_actions` has the layout required by SERVICE_CONFIG_FAILURE_ACTIONS, its
+    // action array outlives the synchronous call, and null strings leave them unset.
+    unsafe {
+        ChangeServiceConfig2W(
+            service.0,
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            Some(ptr::from_ref(&failure_actions).cast()),
+        )
+    }
+    .map_err(|_| {
+        MaintenanceError::new(
+            ErrorCode::RootUnauthorized,
+            "service failure actions could not be configured",
         )
     })?;
 
@@ -4214,6 +4281,29 @@ fn read_service_file(path: &Path, maximum: usize) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod service_configuration_tests {
+    use super::{SERVICE_REQUIRED_PRIVILEGES, required_privileges_multi_string};
+
+    #[test]
+    fn required_privileges_form_a_double_nul_terminated_list() {
+        let list = required_privileges_multi_string();
+        let text = String::from_utf16(&list).unwrap();
+        assert_eq!(text, "SeChangeNotifyPrivilege\0SeImpersonatePrivilege\0\0");
+        assert!(!SERVICE_REQUIRED_PRIVILEGES.iter().any(|privilege| {
+            [
+                "SeBackup",
+                "SeRestore",
+                "SeTakeOwnership",
+                "SeDebug",
+                "SeTcb",
+            ]
+            .iter()
+            .any(|forbidden| privilege.starts_with(forbidden))
+        }));
+    }
 }
 
 #[cfg(test)]

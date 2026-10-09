@@ -49,10 +49,10 @@ use windows::{
                 CertGetCertificateContextProperty,
             },
             DACL_SECURITY_INFORMATION, DuplicateToken, FreeSid, GetTokenInformation,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
-            SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-            SecurityIdentification, SetFileSecurityW, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_TYPE,
-            TOKEN_USER, TokenElevation, TokenImpersonation, TokenPrimary, TokenType, TokenUser,
+            PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT, SecurityIdentification, TOKEN_ELEVATION,
+            TOKEN_QUERY, TOKEN_TYPE, TOKEN_USER, TokenElevation, TokenImpersonation, TokenPrimary,
+            TokenType, TokenUser,
             WinTrust::{
                 WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
                 WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
@@ -129,8 +129,14 @@ use crate::{
     valid_identifier, valid_job_identifier, verify_file_set, verify_registry_set,
 };
 
+#[path = "windows_data_directory.rs"]
+mod data_directory;
 #[path = "windows_upgrade.rs"]
 mod upgrade;
+use data_directory::{
+    open_service_data_directory, program_files_root, provision_service_data_directory,
+    service_data_directory,
+};
 use sha2::{Digest, Sha256};
 pub use upgrade::{
     EnsureServiceResult, RemoveServiceResult, ServiceBundleEvidence,
@@ -412,7 +418,7 @@ pub fn create_system_service(executable: &Path) -> Result<()> {
     })?;
 
     configure_system_service(&service)?;
-    provision_service_data_directory()
+    provision_service_data_directory().map(|_| ())
 }
 
 fn configure_system_service(service: &ServiceHandle) -> Result<()> {
@@ -807,31 +813,6 @@ pub fn signal_launcher_ready(event_name: &str) -> Result<()> {
 pub fn wait_for_process_exit(process_id: u32) -> Result<()> {
     let process = LauncherProcess::open(process_id)?;
     while !process.wait(Duration::from_secs(30))? {}
-    Ok(())
-}
-
-fn provision_service_data_directory() -> Result<()> {
-    let data_directory = service_data_directory()?;
-    fs::create_dir_all(&data_directory).map_err(|_| {
-        MaintenanceError::new(
-            ErrorCode::RootUnauthorized,
-            "protected service data directory cannot be created",
-        )
-    })?;
-    let descriptor = LocalSecurityDescriptor::parse("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
-    let path = wide_null(data_directory.as_os_str().to_string_lossy().as_ref());
-    let information = windows::Win32::Security::OBJECT_SECURITY_INFORMATION(
-        DACL_SECURITY_INFORMATION.0 | PROTECTED_DACL_SECURITY_INFORMATION.0,
-    );
-    // SAFETY: the path is NUL-terminated and the parsed self-relative descriptor remains live for
-    // this synchronous DACL update. The installer is required to be elevated.
-    let applied = unsafe { SetFileSecurityW(PCWSTR(path.as_ptr()), information, descriptor.raw()) };
-    if !applied.as_bool() {
-        return Err(MaintenanceError::new(
-            ErrorCode::RootUnauthorized,
-            "protected service data DACL cannot be applied",
-        ));
-    }
     Ok(())
 }
 
@@ -3143,10 +3124,10 @@ fn service_loop() -> Result<()> {
     let stop_event = create_event(true, false)?;
     STOP_EVENT.store(stop_event.raw().0, Ordering::SeqCst);
 
-    let data_directory = service_data_directory()?;
-    // Setup creates this directory with a protected DACL. The service never silently recreates a
-    // missing directory with inherited permissions.
-    let _data_handle = open_absolute_directory(&data_directory, false)?;
+    // Setup creates this directory with an administrator owner and a protected DACL. The service
+    // never recreates a missing directory and refuses one that a non-administrator could change.
+    let data_handle = open_service_data_directory()?;
+    let data_directory = data_handle.path().to_path_buf();
     let registry_path = data_directory.join("roots-v1.json");
     let roots = if registry_path.exists() {
         RootRegistry::load(&registry_path)?
@@ -4015,23 +3996,6 @@ fn report_status_with_exit(
             "service status could not be reported",
         )
     })
-}
-
-fn service_data_directory() -> Result<PathBuf> {
-    let program_data = std::env::var_os("ProgramData").ok_or_else(|| {
-        MaintenanceError::new(
-            ErrorCode::TransactionState,
-            "ProgramData is unavailable to the service",
-        )
-    })?;
-    let path = PathBuf::from(program_data).join("SE7EN").join("Service");
-    if !path.is_absolute() {
-        return Err(MaintenanceError::new(
-            ErrorCode::TransactionState,
-            "service data directory is not absolute",
-        ));
-    }
-    Ok(path)
 }
 
 fn generation_from_job_id(job_id: &str) -> Option<(String, GenerationRecord)> {

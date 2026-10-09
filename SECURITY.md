@@ -23,6 +23,7 @@ to the appropriate release.
 | Signed keyrings, file sets and registry sets | `src/trust.rs`, `src/file_set.rs`, `src/registry_set.rs` |
 | Registered paths and registry scopes | `src/roots.rs`, `src/registry_scopes.rs` |
 | Transactions and recovery | `src/transaction.rs` |
+| Protected data directory and system folder lookup | `src/windows_data_directory.rs` |
 | Service installation, upgrade and removal | `src/service_upgrade.rs`, `src/windows_upgrade.rs`, `installer/SE7ENService.iss` |
 | Manager commands and launcher restart | `src/bin/client.rs` |
 

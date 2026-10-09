@@ -19,10 +19,7 @@ use windows::{
             ERROR_SERVICE_NOT_ACTIVE, GetLastError, WIN32_ERROR,
         },
         Globalization::GetUserDefaultUILanguage,
-        Security::{
-            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
-            TOKEN_DUPLICATE, TOKEN_QUERY,
-        },
+        Security::{TOKEN_DUPLICATE, TOKEN_QUERY},
         Storage::FileSystem::{
             DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
             MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW,
@@ -70,11 +67,11 @@ use crate::{
 use super::{
     KernelHandle, LocalSecurityDescriptor, RegistryKey, SERVICE_ACCOUNT, SERVICE_DISPLAY_NAME,
     SERVICE_NAME, ServiceHandle, call_shared_service, configure_system_service,
-    create_system_service, delete_by_handle, install_verified_keyring_bytes, lock_parent_chain,
-    open_absolute_directory, open_relative_file, provision_service_data_directory,
+    create_system_service, delete_by_handle, install_verified_keyring_bytes, open_relative_file,
+    open_service_data_directory, program_files_root, provision_service_data_directory,
     read_service_file, recover_service_file_replacement, regular_file_snapshot,
-    rename_handle_relative, replace_service_file, service_data_directory, token_is_administrator,
-    token_is_elevated, verify_authenticode_signer, verify_candidate_keyring_bytes, wide_null,
+    rename_handle_relative, replace_service_file, token_is_administrator, token_is_elevated,
+    verify_authenticode_signer, verify_candidate_keyring_bytes, wide_null,
 };
 
 const INSTALLER_MUTEX_NAME: &str = r"Global\SE7ENServiceInstaller-v1";
@@ -151,13 +148,12 @@ fn install_system_service(
 ) -> Result<EnsureServiceResult> {
     let manager = open_setup_manager()?;
     let service = open_setup_service(&manager)?;
-    let _data_lock = if service.is_some() {
-        open_absolute_directory(&service_data_directory()?, false)?
+    let data_lock = if service.is_some() {
+        open_service_data_directory()?
     } else {
-        provision_installer_data_directory()?;
-        open_absolute_directory(&service_data_directory()?, false)?
+        provision_service_data_directory()?
     };
-    let data_directory = service_data_directory()?;
+    let data_directory = data_lock.path().to_path_buf();
     let release_path = data_directory.join(RELEASE_RECORD_FILE);
     let journal_path = data_directory.join(UPGRADE_JOURNAL_FILE);
     let installed = load_release_record(&release_path)?;
@@ -469,7 +465,11 @@ fn run_elevated_service_removal() -> Result<bool> {
 }
 
 fn remove_service_release_record() -> Result<()> {
-    let data_directory = service_data_directory()?;
+    // A directory that fails the ownership check is not this component's state; leave it alone.
+    let Ok(data_lock) = open_service_data_directory() else {
+        return Ok(());
+    };
+    let data_directory = data_lock.path();
     for file in [RELEASE_RECORD_FILE, UPGRADE_JOURNAL_FILE] {
         match std::fs::remove_file(data_directory.join(file)) {
             Ok(()) => {}
@@ -497,9 +497,7 @@ const UNINSTALL_PUBLISHER: &str = "SE7EN Solutions";
 const MANAGER_BINARY_NAME: &str = "Se7enServiceManager.exe";
 
 fn service_install_directory() -> Result<PathBuf> {
-    Ok(managed_program_files_root()?
-        .join("7Launcher")
-        .join("Service"))
+    Ok(program_files_root()?.join("7Launcher").join("Service"))
 }
 
 fn uninstall_registry_result(result: WIN32_ERROR) -> Result<()> {
@@ -802,7 +800,7 @@ impl ServiceUpgradePlatform for WindowsUpgradePlatform {
             change_service_image_path(service, journal.candidate_image_path())?;
         }
         configure_system_service(service)?;
-        provision_service_data_directory()
+        provision_service_data_directory().map(|_| ())
     }
 
     fn verify_candidate_health(&mut self, journal: &ServiceUpgradeJournal) -> Result<()> {
@@ -972,50 +970,6 @@ fn open_setup_service(manager: &ServiceHandle) -> Result<Option<ServiceHandle>> 
     }
 }
 
-fn provision_installer_data_directory() -> Result<()> {
-    let program_data = std::env::var_os("ProgramData").ok_or_else(|| {
-        MaintenanceError::new(
-            ErrorCode::TransactionState,
-            "ProgramData is unavailable to the installer",
-        )
-    })?;
-    let program_data = PathBuf::from(program_data);
-    if !program_data.is_absolute() {
-        return Err(MaintenanceError::new(
-            ErrorCode::TransactionState,
-            "ProgramData is not an absolute path",
-        ));
-    }
-    let components = ["SE7EN".to_owned(), "Service".to_owned()];
-    let Some((_locks, path)) = lock_parent_chain(&program_data, &components, true)? else {
-        return Err(MaintenanceError::new(
-            ErrorCode::RootIdentity,
-            "protected installer data path cannot be created safely",
-        ));
-    };
-    if path != service_data_directory()? {
-        return Err(MaintenanceError::new(
-            ErrorCode::RootIdentity,
-            "protected installer data path is inconsistent",
-        ));
-    }
-    let descriptor = LocalSecurityDescriptor::parse("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
-    let path = wide_null(path.as_os_str().to_string_lossy().as_ref());
-    let information = windows::Win32::Security::OBJECT_SECURITY_INFORMATION(
-        DACL_SECURITY_INFORMATION.0 | PROTECTED_DACL_SECURITY_INFORMATION.0,
-    );
-    // SAFETY: the path and self-relative descriptor remain live through this synchronous DACL set.
-    unsafe { SetFileSecurityW(PCWSTR(path.as_ptr()), information, descriptor.raw()) }
-        .as_bool()
-        .then_some(())
-        .ok_or_else(|| {
-            MaintenanceError::new(
-                ErrorCode::RootUnauthorized,
-                "installer data directory DACL could not be protected",
-            )
-        })
-}
-
 fn validate_service_bundle(manifest: &crate::VerifiedFileSet) -> Result<&crate::FileEntry> {
     let file_set = manifest.file_set();
     if file_set.files.len() != 1
@@ -1056,7 +1010,7 @@ fn stage_candidate_binary(
     })?;
     verify_bundle_file(&mut source, entry, keyring)?;
 
-    let program_files = managed_program_files_root()?;
+    let program_files = program_files_root()?;
     let relative = MANAGED_CANDIDATE_RELATIVE_PATH;
     if let Some(mut existing) = open_relative_file(
         &program_files,
@@ -1103,7 +1057,7 @@ fn stage_candidate_binary(
 }
 
 fn verify_managed_binary(entry: &crate::FileEntry, keyring: &crate::VerifiedKeyring) -> Result<()> {
-    let program_files = managed_program_files_root()?;
+    let program_files = program_files_root()?;
     let mut binary = open_relative_file(
         &program_files,
         MANAGED_SERVICE_RELATIVE_PATH,
@@ -1121,7 +1075,7 @@ fn verify_managed_binary(entry: &crate::FileEntry, keyring: &crate::VerifiedKeyr
 }
 
 fn activate_staged_service_binary(previous_relative_path: Option<&str>) -> Result<()> {
-    let program_files = managed_program_files_root()?;
+    let program_files = program_files_root()?;
     activate_staged_service_binary_at(&program_files, previous_relative_path)
 }
 
@@ -1202,7 +1156,7 @@ fn activate_staged_service_binary_at(
 }
 
 fn restore_previous_service_binary() -> Result<()> {
-    let program_files = managed_program_files_root()?;
+    let program_files = program_files_root()?;
     restore_previous_service_binary_at(&program_files)
 }
 
@@ -1237,7 +1191,7 @@ fn restore_previous_service_binary_at(program_files: &Path) -> Result<()> {
 }
 
 fn delete_managed_file(relative: &str) -> Result<()> {
-    let program_files = managed_program_files_root()?;
+    let program_files = program_files_root()?;
     delete_managed_file_at(&program_files, relative)
 }
 
@@ -1293,33 +1247,12 @@ fn hash_open_file(file: &mut File) -> Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
-fn managed_program_files_root() -> Result<PathBuf> {
-    let root = std::env::var_os("ProgramW6432")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .ok_or_else(|| {
-            MaintenanceError::new(
-                ErrorCode::TransactionState,
-                "Program Files is unavailable to the installer",
-            )
-        })?;
-    let root = PathBuf::from(root);
-    if !root.is_absolute() {
-        return Err(MaintenanceError::new(
-            ErrorCode::TransactionState,
-            "Program Files is not an absolute path",
-        ));
-    }
-    Ok(root)
-}
-
 fn managed_binary_path() -> Result<PathBuf> {
-    Ok(managed_binary_path_at(&managed_program_files_root()?))
+    Ok(managed_binary_path_at(&program_files_root()?))
 }
 
 fn managed_candidate_binary_path() -> Result<PathBuf> {
-    Ok(managed_candidate_binary_path_at(
-        &managed_program_files_root()?,
-    ))
+    Ok(managed_candidate_binary_path_at(&program_files_root()?))
 }
 
 fn managed_binary_path_at(program_files: &Path) -> PathBuf {
@@ -1461,7 +1394,7 @@ fn supported_previous_binary_relative_path(
     expected: &str,
 ) -> Result<&'static str> {
     let current = query_service_config(service)?.image_path;
-    let program_files = managed_program_files_root()?;
+    let program_files = program_files_root()?;
     let known_mixed_current =
         service_image_path(&program_files.join(Path::new(MANAGED_SERVICE_RELATIVE_PATH)))?;
     let previous_native = service_image_path(&previous_managed_binary_path_at(&program_files))?;

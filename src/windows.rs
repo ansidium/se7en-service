@@ -1901,6 +1901,60 @@ fn final_path_owned(file: &File) -> Result<PathBuf> {
     Ok(PathBuf::from(text))
 }
 
+/// Creates `directory\name` and writes `contents`, for best-effort diagnostics of an elevated
+/// process whose working directory other users may be able to change.
+///
+/// The file must not exist yet, so an existing file, hard link, or symbolic link is never
+/// overwritten. The directory itself must not be a reparse point, and the new file must end up
+/// directly inside that directory as its only link; otherwise it is deleted again.
+pub fn write_new_diagnostic_file(directory: &Path, name: &str, contents: &[u8]) -> Result<()> {
+    let mut components = Path::new(name).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return Err(MaintenanceError::new(
+            ErrorCode::StagingInvalid,
+            "diagnostic file name must be a single path component",
+        ));
+    }
+    let locked_directory = open_absolute_directory(directory, false)?;
+    let mut file = open_absolute(
+        &directory.join(name),
+        FILE_GENERIC_WRITE.0 | DELETE.0,
+        windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+    .map_err(|_| {
+        MaintenanceError::new(
+            ErrorCode::StagingInvalid,
+            "diagnostic file already exists or cannot be created",
+        )
+    })?;
+    let expected_parent = final_path_owned(&locked_directory)?;
+    let placed = final_path_owned(&file).ok().is_some_and(|path| {
+        path.parent().is_some_and(|parent| {
+            parent
+                .as_os_str()
+                .eq_ignore_ascii_case(expected_parent.as_os_str())
+        })
+    }) && ensure_safe_regular_file(&file).is_ok();
+    if !placed {
+        let _ = delete_by_handle(&file);
+        return Err(MaintenanceError::new(
+            ErrorCode::StagingInvalid,
+            "diagnostic file was created outside its directory",
+        ));
+    }
+    file.write_all(contents).map_err(|_| {
+        MaintenanceError::new(
+            ErrorCode::TransactionIo,
+            "diagnostic file cannot be written",
+        )
+    })
+}
+
 fn rename_handle_relative(
     root: &Path,
     file: &File,
@@ -4160,6 +4214,86 @@ fn read_service_file(path: &Path, maximum: usize) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod diagnostic_file_tests {
+    use std::{
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::*;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn create() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "seven-maintenance-diagnostic-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create temp directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const NAME: &str = "SE7ENService-ensure-service.log";
+
+    #[test]
+    fn writes_a_new_diagnostic_file() {
+        let directory = TempDirectory::create();
+        write_new_diagnostic_file(&directory.0, NAME, b"E_ROOT_IDENTITY").unwrap();
+        assert_eq!(
+            fs::read(directory.0.join(NAME)).unwrap(),
+            b"E_ROOT_IDENTITY"
+        );
+    }
+
+    #[test]
+    fn never_writes_through_an_existing_file_or_hard_link() {
+        let directory = TempDirectory::create();
+        let victim = TempDirectory::create();
+        let protected = victim.0.join("protected.txt");
+        fs::write(&protected, b"original").unwrap();
+        fs::hard_link(&protected, directory.0.join(NAME)).unwrap();
+        assert!(write_new_diagnostic_file(&directory.0, NAME, b"overwritten").is_err());
+        assert_eq!(fs::read(&protected).unwrap(), b"original");
+    }
+
+    #[test]
+    fn refuses_a_directory_junction() {
+        let directory = TempDirectory::create();
+        let target = TempDirectory::create();
+        let junction = directory.0.join("bundle");
+        let created = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target.0)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "create test junction");
+        assert!(write_new_diagnostic_file(&junction, NAME, b"redirected").is_err());
+        assert!(!target.0.join(NAME).exists());
+    }
+
+    #[test]
+    fn the_name_is_a_single_component() {
+        let directory = TempDirectory::create();
+        for name in [r"..\escape.log", r"nested\file.log", r"C:\absolute.log", ""] {
+            let error = write_new_diagnostic_file(&directory.0, name, b"x").unwrap_err();
+            assert_eq!(error.code(), ErrorCode::StagingInvalid, "{name}");
+        }
+    }
 }
 
 #[cfg(test)]

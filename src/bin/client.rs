@@ -19,7 +19,7 @@ mod windows_client {
         windows::{
             LauncherProcess, call_shared_service, confirm_and_elevate_service_removal,
             ensure_system_service, remove_system_service, signal_launcher_ready,
-            verify_service_bundle, verify_service_setup_installer,
+            verify_service_bundle, verify_service_setup_installer, write_new_diagnostic_file,
         },
     };
 
@@ -704,10 +704,14 @@ mod windows_client {
     }
 
     fn write_ensure_service_diagnostic(bundle_root: &Path, message: &str) {
-        // The elevated installer extracts this client into its private temporary bundle directory.
-        // Diagnostics are best-effort and must never replace the authoritative operation result.
-        let _ = std::fs::write(
-            bundle_root.join(ENSURE_SERVICE_DIAGNOSTIC_FILE),
+        // The service setup reads this file from its private temporary bundle directory. Other
+        // callers may run this elevated client from a directory that users can change, so the
+        // file is only ever created new, never written through an existing name or a junction.
+        // Diagnostics are best-effort and must never replace the authoritative operation result,
+        // which is printed as well.
+        let _ = write_new_diagnostic_file(
+            bundle_root,
+            ENSURE_SERVICE_DIAGNOSTIC_FILE,
             message.as_bytes(),
         );
     }

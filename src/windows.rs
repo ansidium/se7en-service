@@ -86,7 +86,8 @@ use windows::{
             },
             Registry::{
                 HKEY, HKEY_LOCAL_MACHINE, KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_SET_VALUE,
-                KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE,
+                KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_LINK,
+                REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK,
                 REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW,
                 RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
             },
@@ -2594,110 +2595,152 @@ fn registry_view_access(view: RegistryView) -> u32 {
     }
 }
 
+/// Whether `key` is a registry symbolic link, which stores its target in `SymbolicLinkValue`.
+fn registry_key_is_link(key: &RegistryKey) -> Result<bool> {
+    let name = wide_null("SymbolicLinkValue");
+    let mut kind = REG_VALUE_TYPE::default();
+    // SAFETY: the key handle is live with KEY_QUERY_VALUE, the name is NUL-terminated, and only the
+    // value type is requested.
+    let status = unsafe {
+        RegQueryValueExW(
+            key.raw(),
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut kind),
+            None,
+            None,
+        )
+    };
+    if status.0 == ERROR_FILE_NOT_FOUND.0 {
+        return Ok(false);
+    }
+    if status.0 != 0 {
+        return Err(MaintenanceError::with_platform_status(
+            ErrorCode::RegistryIo,
+            "registry key link state cannot be read",
+            status.0,
+        ));
+    }
+    Ok(kind == REG_LINK)
+}
+
+/// Opens, or creates, `subkey` below `root` one component at a time. Each component is opened
+/// with REG_OPTION_OPEN_LINK and refused if it is a symbolic link, so a link placed anywhere on
+/// the path cannot redirect the service's writes to another key.
+fn open_registry_path(
+    root: HKEY,
+    subkey: &str,
+    final_access: u32,
+    view_access: u32,
+    create: bool,
+) -> std::result::Result<RegistryKey, RegistryPathError> {
+    let mut components = subkey.split('\\').peekable();
+    let mut parent: Option<RegistryKey> = None;
+    while let Some(component) = components.next() {
+        let access = if components.peek().is_none() {
+            final_access
+        } else if create {
+            KEY_CREATE_SUB_KEY.0
+        } else {
+            0
+        };
+        let access = REG_SAM_FLAGS(access | KEY_QUERY_VALUE.0 | view_access);
+        let parent_handle = parent.as_ref().map_or(root, RegistryKey::raw);
+        let name = wide_null(component);
+        let mut child = HKEY::default();
+        // SAFETY: the parent handle is HKLM/HKCU or a live key owned by `parent`, the component is
+        // NUL-terminated, and a returned handle is owned by RegistryKey. REG_OPTION_OPEN_LINK opens
+        // a link key itself instead of its target.
+        let status = unsafe {
+            if create {
+                RegCreateKeyExW(
+                    parent_handle,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    PCWSTR::null(),
+                    REG_OPEN_CREATE_OPTIONS(REG_OPTION_NON_VOLATILE.0 | REG_OPTION_OPEN_LINK.0),
+                    access,
+                    None,
+                    &mut child,
+                    None,
+                )
+            } else {
+                RegOpenKeyExW(
+                    parent_handle,
+                    PCWSTR(name.as_ptr()),
+                    Some(REG_OPTION_OPEN_LINK.0),
+                    access,
+                    &mut child,
+                )
+            }
+        };
+        if status.0 != 0 {
+            return Err(RegistryPathError::Status(status.0));
+        }
+        let child = RegistryKey::new(child).map_err(RegistryPathError::Other)?;
+        if registry_key_is_link(&child).map_err(RegistryPathError::Other)? {
+            return Err(RegistryPathError::Other(MaintenanceError::new(
+                ErrorCode::RegistryScopeUnauthorized,
+                "registry scope path contains a symbolic link",
+            )));
+        }
+        parent = Some(child);
+    }
+    parent.ok_or(RegistryPathError::Other(MaintenanceError::new(
+        ErrorCode::RegistryScopeInvalid,
+        "registry scope path is empty",
+    )))
+}
+
+enum RegistryPathError {
+    /// A Win32 status from opening or creating a component.
+    Status(u32),
+    Other(MaintenanceError),
+}
+
 fn create_registry_scope_key(scope: &RegisteredRegistryScope) -> Result<RegistryKey> {
-    let mut components = scope.subkey().split('\\').peekable();
-    if components.next() != Some("SOFTWARE") {
+    if scope.subkey().split('\\').next() != Some("SOFTWARE") || !scope.subkey().contains('\\') {
         return Err(MaintenanceError::new(
             ErrorCode::RegistryScopeInvalid,
             "registry scope is outside HKLM SOFTWARE",
         ));
     }
-
-    let software = wide_null("SOFTWARE");
-    let mut parent = HKEY::default();
-    let parent_access = REG_SAM_FLAGS(KEY_CREATE_SUB_KEY.0 | registry_view_access(scope.view()));
-    // SAFETY: this runs only after caller authorization and RevertToSelf. The predefined HKLM
-    // handle and NUL-terminated literal are valid for the synchronous call. The returned handle
-    // is owned by RegistryKey.
-    let result = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(software.as_ptr()),
-            None,
-            parent_access,
-            &mut parent,
-        )
-    };
-    if result.0 != 0 {
-        return Err(MaintenanceError::with_platform_status(
+    // This runs only after caller authorization and RevertToSelf. Default ACL inheritance is
+    // preserved and no caller-supplied DACL or service-specific ACE is used. The final handle
+    // receives only the QueryValue + SetValue runtime rights.
+    open_registry_path(
+        HKEY_LOCAL_MACHINE,
+        scope.subkey(),
+        KEY_QUERY_VALUE.0 | KEY_SET_VALUE.0,
+        registry_view_access(scope.view()),
+        true,
+    )
+    .map_err(|error| match error {
+        RegistryPathError::Status(status) => MaintenanceError::with_platform_status(
             ErrorCode::RegistryScopeUnauthorized,
-            "LocalSystem cannot open HKLM SOFTWARE for bounded scope creation",
-            result.0,
-        ));
-    }
-    let mut parent = RegistryKey::new(parent)?;
-
-    while let Some(component) = components.next() {
-        let final_component = components.peek().is_none();
-        let access = if final_component {
-            KEY_QUERY_VALUE.0 | KEY_SET_VALUE.0
-        } else {
-            KEY_CREATE_SUB_KEY.0
-        };
-        let access = REG_SAM_FLAGS(access | registry_view_access(scope.view()));
-        let component = wide_null(component);
-        let mut child = HKEY::default();
-        // SAFETY: every component comes from the canonical, bounded registry-subkey validator.
-        // Only one exact child is created per call. Intermediate handles receive CreateSubKey;
-        // the final handle receives only the QueryValue + SetValue runtime rights. Default ACL
-        // inheritance is preserved and no caller-supplied DACL or service-specific ACE is used.
-        let result = unsafe {
-            RegCreateKeyExW(
-                parent.raw(),
-                PCWSTR(component.as_ptr()),
-                None,
-                PCWSTR::null(),
-                REG_OPTION_NON_VOLATILE,
-                access,
-                None,
-                &mut child,
-                None,
-            )
-        };
-        if result.0 != 0 {
-            return Err(MaintenanceError::with_platform_status(
-                ErrorCode::RegistryScopeUnauthorized,
-                "LocalSystem cannot create or open a bounded HKLM registry-scope component",
-                result.0,
-            ));
-        }
-        let child = RegistryKey::new(child)?;
-        if final_component {
-            return Ok(child);
-        }
-        parent = child;
-    }
-
-    Err(MaintenanceError::new(
-        ErrorCode::RegistryScopeInvalid,
-        "registry scope has no child below HKLM SOFTWARE",
-    ))
+            "LocalSystem cannot create or open a bounded HKLM registry-scope component",
+            status,
+        ),
+        RegistryPathError::Other(error) => error,
+    })
 }
 
 fn open_registry_scope_key(scope: &RegisteredRegistryScope) -> Result<RegistryKey> {
-    let subkey = wide_null(scope.subkey());
-    let access =
-        REG_SAM_FLAGS(KEY_QUERY_VALUE.0 | KEY_SET_VALUE.0 | registry_view_access(scope.view()));
-    let mut key = HKEY::default();
-    // SAFETY: the HKLM pseudo-handle and NUL-terminated subkey remain live for the synchronous
-    // call. The returned key is owned by RegistryKey.
-    let result = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey.as_ptr()),
-            None,
-            access,
-            &mut key,
-        )
-    };
-    if result.0 != 0 {
-        return Err(MaintenanceError::with_platform_status(
+    open_registry_path(
+        HKEY_LOCAL_MACHINE,
+        scope.subkey(),
+        KEY_QUERY_VALUE.0 | KEY_SET_VALUE.0,
+        registry_view_access(scope.view()),
+        false,
+    )
+    .map_err(|error| match error {
+        RegistryPathError::Status(status) => MaintenanceError::with_platform_status(
             ErrorCode::RegistryScopeInvalid,
             "registered HKLM scope cannot be opened by the service",
-            result.0,
-        ));
-    }
-    RegistryKey::new(key)
+            status,
+        ),
+        RegistryPathError::Other(error) => error,
+    })
 }
 
 fn registered_registry_scope_as_caller(
@@ -4473,6 +4516,103 @@ fn read_service_file(path: &Path, maximum: usize) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod registry_link_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
+
+    use super::*;
+
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
+
+    /// A per-test key below HKCU\Software, deleted with its subtree afterwards.
+    struct TestKey(String);
+
+    impl TestKey {
+        fn create() -> Self {
+            Self(format!(
+                r"Software\SE7ENServiceRegistryLinkTest-{}-{}",
+                std::process::id(),
+                NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+
+        fn path(&self, relative: &str) -> String {
+            format!(r"{}\{relative}", self.0)
+        }
+    }
+
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            let path = wide_null(&self.0);
+            // SAFETY: the path is NUL-terminated and names only this test's own key.
+            let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr())) };
+        }
+    }
+
+    fn open(path: &str, create: bool) -> std::result::Result<RegistryKey, RegistryPathError> {
+        open_registry_path(
+            HKEY_CURRENT_USER,
+            path,
+            KEY_QUERY_VALUE.0 | KEY_SET_VALUE.0,
+            0,
+            create,
+        )
+    }
+
+    #[test]
+    fn a_symbolic_link_anywhere_on_the_scope_path_is_refused() {
+        let key = TestKey::create();
+        open(&key.path(r"Plain\Child"), true).unwrap_or_else(|_| panic!("plain path"));
+        open(&key.path(r"Plain\Child"), false).unwrap_or_else(|_| panic!("reopen plain path"));
+
+        // Mark a key the way the registry marks a symbolic link. Following a real link is not
+        // needed to show that the walk checks every component before it continues.
+        let linked = open(&key.path("Linked"), true).unwrap_or_else(|_| panic!("linked key"));
+        let name = wide_null("SymbolicLinkValue");
+        let target: Vec<u8> = r"\REGISTRY\MACHINE\SOFTWARE"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        // SAFETY: the key handle has KEY_SET_VALUE and the name and data outlive the call.
+        let status = unsafe {
+            RegSetValueExW(
+                linked.raw(),
+                PCWSTR(name.as_ptr()),
+                None,
+                REG_LINK,
+                Some(&target),
+            )
+        };
+        assert_eq!(status.0, 0, "mark the test key as a link");
+        drop(linked);
+
+        for create in [true, false] {
+            match open(&key.path(r"Linked\Child"), create) {
+                Err(RegistryPathError::Other(error)) => {
+                    assert_eq!(error.code(), ErrorCode::RegistryScopeUnauthorized);
+                }
+                _ => panic!("a link on the path must be refused (create={create})"),
+            }
+            match open(&key.path("Linked"), create) {
+                Err(RegistryPathError::Other(error)) => {
+                    assert_eq!(error.code(), ErrorCode::RegistryScopeUnauthorized);
+                }
+                _ => panic!("a link as the final key must be refused (create={create})"),
+            }
+        }
+        assert!(matches!(
+            open(&key.path(r"Linked\Child"), false),
+            Err(RegistryPathError::Other(_))
+        ));
+        assert!(matches!(
+            open(&key.path("Missing"), false),
+            Err(RegistryPathError::Status(status)) if status == ERROR_FILE_NOT_FOUND.0
+        ));
+    }
 }
 
 #[cfg(test)]

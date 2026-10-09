@@ -306,9 +306,16 @@ pub(crate) fn validate_registry_subkey(value: &str) -> Result<()> {
         ));
     }
     let folded = value.to_ascii_lowercase();
-    const FORBIDDEN_PREFIXES: [&str; 6] = [
+    // Each of these runs code or changes security for every user: Image File Execution Options
+    // and Winlogon live under Windows NT, cmd.exe runs Command Processor\AutoRun, Active Setup
+    // runs StubPath at logon.
+    const FORBIDDEN_PREFIXES: [&str; 10] = [
         "software\\classes",
+        "software\\microsoft\\active setup",
+        "software\\microsoft\\command processor",
         "software\\microsoft\\windows",
+        "software\\microsoft\\windows defender",
+        "software\\microsoft\\windows nt",
         "software\\policies",
         "software\\wow6432node\\classes",
         "software\\wow6432node\\microsoft\\windows",
@@ -387,11 +394,25 @@ mod tests {
             "S-1-5-21-1000",
         )
         .expect("game vendor key is allowed");
+        RegisteredRegistryScope::new(
+            "sample-classic",
+            "sample-app",
+            RegistryView::Registry32,
+            r"SOFTWARE\Microsoft\Microsoft Games\SampleApp",
+            allowed(),
+            "S-1-5-21-1000",
+        )
+        .expect("a game key below SOFTWARE\\Microsoft is allowed");
 
         for forbidden in [
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
             r"SOFTWARE\Policies\SE7EN",
             r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\game.exe",
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            r"SOFTWARE\Microsoft\Command Processor",
+            r"SOFTWARE\Microsoft\Active Setup\Installed Components\{00000000-0000-0000-0000-000000000000}",
+            r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths",
         ] {
             assert_eq!(
                 RegisteredRegistryScope::new(

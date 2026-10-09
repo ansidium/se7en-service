@@ -2,7 +2,12 @@
 
 #[cfg(windows)]
 mod windows_authorization {
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::SystemTime,
+    };
 
     use seven_launcher_maintenance::{
         AllowedRegistryValue, RegisteredRegistryScope, RegisteredRoot, RegistryScopeRegistry,
@@ -17,6 +22,9 @@ mod windows_authorization {
     const OWNER_SID: &str = "S-1-5-21-1000";
     const OTHER_SID: &str = "S-1-5-21-2000";
 
+    // Parallel tests can read the same clock value; the counter keeps their directories apart.
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
     struct TempDirectory(PathBuf);
 
     impl TempDirectory {
@@ -26,8 +34,9 @@ mod windows_authorization {
                 .expect("system time")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "seven-maintenance-auth-{label}-{}-{nanos}",
-                std::process::id()
+                "seven-maintenance-auth-{label}-{}-{nanos}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).expect("create temp directory");
             Self(path)

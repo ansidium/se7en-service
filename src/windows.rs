@@ -4658,12 +4658,21 @@ mod service_configuration_tests {
     }
 }
 
+/// Creates a directory junction for a test; junctions need no elevation.
+#[cfg(test)]
+fn create_test_junction(link: &Path, target: &Path) {
+    let created = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("run mklink");
+    assert!(created.status.success(), "create test junction");
+}
+
 #[cfg(test)]
 mod diagnostic_file_tests {
-    use std::{
-        process::Command,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -4717,13 +4726,7 @@ mod diagnostic_file_tests {
         let directory = TempDirectory::create();
         let target = TempDirectory::create();
         let junction = directory.0.join("bundle");
-        let created = Command::new("cmd.exe")
-            .args(["/d", "/c", "mklink", "/J"])
-            .arg(&junction)
-            .arg(&target.0)
-            .output()
-            .unwrap();
-        assert!(created.status.success(), "create test junction");
+        create_test_junction(&junction, &target.0);
         assert!(write_new_diagnostic_file(&junction, NAME, b"redirected").is_err());
         assert!(!target.0.join(NAME).exists());
     }

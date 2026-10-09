@@ -514,7 +514,6 @@ mod state_removal_tests {
     use std::{
         fs,
         path::PathBuf,
-        process::Command,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -558,13 +557,7 @@ mod state_removal_tests {
         ] {
             fs::write(state.join(file), b"{}").unwrap();
         }
-        let linked = Command::new("cmd.exe")
-            .args(["/d", "/c", "mklink", "/J"])
-            .arg(state.join("jobs").join("link"))
-            .arg(&outside.0)
-            .output()
-            .unwrap();
-        assert!(linked.status.success(), "create test junction");
+        super::super::create_test_junction(&state.join("jobs").join("link"), &outside.0);
 
         remove_state_directory(&state).unwrap();
         assert!(!state.exists());

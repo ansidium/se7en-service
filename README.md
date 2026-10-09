@@ -80,11 +80,11 @@ configuration. An unsigned local build is not a production installation bundle.
 
 ## Source and releases
 
-Download the existing signed distribution files from
-[SE7EN Service 1.0.2 (gen 4)](https://github.com/ansidium/se7en-service/releases/tag/v1.0.2-generation.4).
-The release includes the service, manager, signed bundle manifests, and
-`SHA256SUMS.txt`. These files retain their original bytes and
-signatures; they were not rebuilt or re-signed for this publication.
+Download the signed distribution files from
+[SE7EN Service 1.0.4](https://github.com/ansidium/se7en-service/releases/tag/v1.0.4),
+built from this repository. The release includes the service, manager, signed
+bundle manifests, and `SHA256SUMS.txt`. Earlier releases stay available on the
+releases page with their original bytes and signatures.
 
 The source starts with a standalone snapshot and contains no launcher application
 source or private repository history. Release notes identify the generation and

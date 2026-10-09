@@ -5,10 +5,25 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
     println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=assets/service.ico");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // Without the Visual C++ Redistributable a dynamic-CRT build does not start, and the
+        // LocalSystem service would search PATH for the missing DLL.
+        let static_crt = env::var("CARGO_CFG_TARGET_FEATURE")
+            .is_ok_and(|features| features.split(',').any(|feature| feature == "crt-static"));
+        if !static_crt {
+            println!(
+                "cargo::error=MSVC builds must link the CRT statically: keep .cargo/config.toml \
+                 and do not override it with RUSTFLAGS, or add -C target-feature=+crt-static"
+            );
+            return;
+        }
         println!("cargo::rustc-link-arg-bins=/Brepro");
+        // LOAD_LIBRARY_SEARCH_SYSTEM32: non-KnownDLL imports such as wintrust.dll and
+        // crypt32.dll load only from System32, never from the application directory.
+        println!("cargo::rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
     }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         compile_windows_version_resources();

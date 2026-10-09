@@ -1,0 +1,8 @@
+# Both executables must start on Windows without the Visual C++ Redistributable, so the CRT is
+# linked statically. RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS in the environment replace these flags;
+# build.rs rejects an MSVC build that lost crt-static that way.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

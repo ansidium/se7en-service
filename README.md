@@ -61,6 +61,12 @@ cargo test --locked --target i686-pc-windows-msvc
 cargo build --release --locked --target i686-pc-windows-msvc
 ```
 
+`.cargo/config.toml` links the C runtime statically, so both executables run
+without the Visual C++ Redistributable. Do not override it with `RUSTFLAGS`:
+the build script rejects an MSVC build without `crt-static`. Dependent DLLs
+load only from System32 (`/DEPENDENTLOADFLAG:0x800`); `tests/pe_imports.rs`
+checks both properties.
+
 Cargo produces `target/i686-pc-windows-msvc/release/service.exe` and `client.exe`.
 The distribution names are `Se7enService.exe` and `Se7enServiceManager.exe`.
 These local outputs are unsigned. Tests use synthetic data and test keys;

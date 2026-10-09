@@ -30,3 +30,9 @@ jobs:
         run: cargo test --locked --target i686-pc-windows-msvc
       - name: Release build
         run: cargo build --release --locked --target i686-pc-windows-msvc
+      - name: Release imports
+        env:
+          SE7EN_RELEASE_BINARIES: target/i686-pc-windows-msvc/release/service.exe;target/i686-pc-windows-msvc/release/client.exe
+        run: >-
+          cargo test --locked --target i686-pc-windows-msvc --test pe_imports --
+          --ignored --exact release_binaries_from_environment_run_without_the_visual_cpp_redistributable

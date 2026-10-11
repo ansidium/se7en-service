@@ -7,6 +7,12 @@
 //! handle-based filesystem policy stay in this module. Every caller outside this module sees only
 //! typed maintenance operations.
 
+mod direct_update;
+pub use direct_update::{
+    PreparedDirectUpdate, prepare_direct_launcher_update, recover_direct_launcher_update,
+    verify_direct_launcher_plan,
+};
+
 use std::{
     collections::BTreeMap,
     ffi::c_void,

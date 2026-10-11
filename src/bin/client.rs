@@ -18,7 +18,8 @@ mod windows_client {
         service_upgrade::ServiceVersion,
         windows::{
             LauncherProcess, call_shared_service, confirm_and_elevate_service_removal,
-            ensure_system_service, remove_system_service, signal_launcher_ready,
+            ensure_system_service, prepare_direct_launcher_update, recover_direct_launcher_update,
+            remove_system_service, signal_launcher_ready, verify_direct_launcher_plan,
             verify_service_bundle, verify_service_setup_installer, write_new_diagnostic_file,
         },
     };
@@ -274,6 +275,66 @@ mod windows_client {
                     ));
                 }
                 print_response(&response)?;
+                None
+            }
+            Some("direct-update-plan") => {
+                let restart = required_path(&mut arguments, "Launcher path")?;
+                let manifest = required_path(&mut arguments, "Launcher FileSet manifest")?;
+                let keyring = required_path(&mut arguments, "signed keyring")?;
+                ensure_finished(arguments)?;
+                let plan = verify_direct_launcher_plan(&manifest, &keyring, &restart)
+                    .map_err(display_error)?;
+                print_response(&serde_json::json!({"ok":true,"fileSet":plan.file_set()}))?;
+                None
+            }
+            Some("direct-update-restart") => {
+                let process_id = required_text(&mut arguments, "Launcher PID")?
+                    .parse::<u32>()
+                    .map_err(|_| "Launcher PID must be an unsigned integer".to_owned())?;
+                let restart = required_path(&mut arguments, "Launcher path")?;
+                let manifest = required_path(&mut arguments, "Launcher FileSet manifest")?;
+                let keyring = required_path(&mut arguments, "signed keyring")?;
+                let staging = required_path(&mut arguments, "Launcher staging directory")?;
+                let event = required_text(&mut arguments, "ready event")?;
+                ensure_finished(arguments)?;
+                validate_restart_executable(&restart)?;
+                let process = LauncherProcess::open(process_id).map_err(display_error)?;
+                let prepared =
+                    prepare_direct_launcher_update(&restart, &manifest, &keyring, &staging)
+                        .map_err(display_error)?;
+                if let Err(error) = signal_launcher_ready(&event) {
+                    prepared.cancel().map_err(display_error)?;
+                    return Err(display_error(error));
+                }
+                if !process
+                    .wait(Duration::from_secs(120))
+                    .map_err(display_error)?
+                {
+                    prepared.cancel().map_err(display_error)?;
+                    return Err("Launcher did not exit before the handoff deadline".to_owned());
+                }
+                let outcome = prepared.commit();
+                // RecoveryIncomplete means the file group may still be mixed. A restart
+                // is allowed only after a completed commit or verified complete rollback.
+                if outcome.as_ref().is_err_and(|error| {
+                    error.code() == seven_launcher_maintenance::ErrorCode::RecoveryIncomplete
+                }) {
+                    return outcome.map(|_| ()).map_err(display_error);
+                }
+                restart_launcher(&restart)?;
+                match outcome {
+                    Ok(result) => print_response(&serde_json::json!({"ok":true,
+                        "state":"committed", "jobId":result.job_id, "generation":result.generation}))?,
+                    Err(error) => return Err(display_error(error)),
+                }
+                None
+            }
+            Some("direct-update-recover") => {
+                let restart = required_path(&mut arguments, "Launcher path")?;
+                let keyring = required_path(&mut arguments, "signed keyring")?;
+                ensure_finished(arguments)?;
+                recover_direct_launcher_update(&restart, &keyring).map_err(display_error)?;
+                print_response(&serde_json::json!({"ok":true,"state":"recovered"}))?;
                 None
             }
             Some("ensure-service") => {

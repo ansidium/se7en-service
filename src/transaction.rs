@@ -83,6 +83,8 @@ pub enum MutationBoundary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationKind {
+    AtomicReplaceTarget,
+    AtomicRestoreBackup,
     RenameTargetToBackup,
     RenamePreparedToTarget,
     DeleteTarget,
@@ -111,6 +113,32 @@ impl MutationFaultInjector for NoFaultInjection {
 }
 
 pub trait TransactionPlatform: Send + Sync {
+    fn uses_atomic_replacement(&self) -> bool {
+        false
+    }
+    /// Opt-in for an unprivileged updater: the executable must never disappear between
+    /// backup and replacement. The service retains its existing handle-rename protocol.
+    fn atomic_replace_target(
+        &self,
+        _root: &RegisteredRoot,
+        _job_id: &str,
+        _index: u32,
+        _relative_path: &str,
+        _original: Option<TargetSnapshot>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn atomic_restore_backup(
+        &self,
+        _root: &RegisteredRoot,
+        _job_id: &str,
+        _index: u32,
+        _relative_path: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     fn verify_root_identity(&self, root: &RegisteredRoot) -> Result<()> {
         local_verify_root_identity(root)
     }
@@ -628,6 +656,31 @@ fn verify_original_snapshots(prepared: &PreparedJob) -> Result<()> {
 
 fn apply_entries(prepared: &PreparedJob) -> Result<()> {
     for entry in &prepared.header.entries {
+        if entry.action == JournalAction::Replace
+            && prepared.policy.platform.uses_atomic_replacement()
+        {
+            run_mutation(
+                &prepared.policy,
+                MutationKind::AtomicReplaceTarget,
+                Some(&entry.path),
+                || {
+                    if !prepared.policy.platform.atomic_replace_target(
+                        &prepared.header.root,
+                        &prepared.header.job_id,
+                        entry.transaction_index,
+                        &entry.path,
+                        entry.original,
+                    )? {
+                        return Err(MaintenanceError::new(
+                            ErrorCode::TransactionState,
+                            "atomic replacement platform refused its operation",
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+            continue;
+        }
         if let Some(original) = entry.original {
             let index = entry.transaction_index;
             run_mutation(
@@ -684,6 +737,28 @@ fn rollback_entries(prepared: &PreparedJob) -> Result<()> {
                 index,
             )?;
         if backup_exists {
+            if prepared.policy.platform.uses_atomic_replacement() {
+                run_mutation(
+                    &prepared.policy,
+                    MutationKind::AtomicRestoreBackup,
+                    Some(&entry.path),
+                    || {
+                        if !prepared.policy.platform.atomic_restore_backup(
+                            &prepared.header.root,
+                            &prepared.header.job_id,
+                            index,
+                            &entry.path,
+                        )? {
+                            return Err(MaintenanceError::new(
+                                ErrorCode::TransactionState,
+                                "atomic rollback platform refused its operation",
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+                continue;
+            }
             if prepared
                 .policy
                 .platform

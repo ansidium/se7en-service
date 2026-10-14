@@ -39,8 +39,8 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA,
-            ERROR_PATH_NOT_FOUND, ERROR_SERVICE_ALREADY_RUNNING, HANDLE, HLOCAL, HWND, LocalFree,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
+            HLOCAL, HWND, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -74,10 +74,11 @@ use windows::{
             FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFO_EX,
             FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-            FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_STANDARD_INFO, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
-            FileDispositionInfoEx, FileIdInfo, FileRenameInfo, FileStandardInfo,
+            FILE_GENERIC_WRITE, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_WRITE_DATA,
+            FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+            FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
             GetDiskFreeSpaceExW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
             OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
         },
@@ -1937,14 +1938,18 @@ fn query_handle<T: Copy>(
 }
 
 fn ensure_not_reparse(file: &File) -> Result<()> {
-    let attributes: FILE_ATTRIBUTE_TAG_INFO = query_handle(file, FileAttributeTagInfo)?;
-    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if is_reparse_point(file)? {
         return Err(MaintenanceError::new(
             ErrorCode::RootIdentity,
             "opened filesystem object is a reparse point",
         ));
     }
     Ok(())
+}
+
+fn is_reparse_point(file: &File) -> Result<bool> {
+    let attributes: FILE_ATTRIBUTE_TAG_INFO = query_handle(file, FileAttributeTagInfo)?;
+    Ok(attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
 }
 
 fn ensure_safe_directory(file: &File) -> Result<()> {
@@ -2177,75 +2182,233 @@ fn delete_by_handle(file: &File) -> Result<()> {
 fn cleanup_reserved_job<'a>(root: impl Into<RootLocation<'a>>, job_id: &str) -> Result<()> {
     let root = root.into();
     // Holding the verified root keeps it from being renamed while its job entries are removed.
+    // Every component below the root is reached through a reparse-checked, identity-verified
+    // handle chain and removed by handle, so a junction or object-manager symlink planted on a
+    // predictable component (`jobs\{id}`, `prepared`, ...) is never traversed: the service either
+    // deletes the planted link itself or refuses, never SYSTEM-deletes the link's target.
     let _root_lock = lock_parent_chain(root, &[], false)?;
-    for leaf in ["prepared", "backup"] {
-        let relative = format!(".7launcher-maintenance/jobs/{job_id}/{leaf}");
-        let directory_path = root.path.join(relative.replace('/', "\\"));
-        let entries = match fs::read_dir(&directory_path) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                return Err(MaintenanceError::new(
-                    ErrorCode::TransactionIo,
-                    "reserved job directory cannot be enumerated",
-                ));
-            }
-        };
-        for entry in entries {
-            let entry = entry.map_err(|_| {
-                MaintenanceError::new(
-                    ErrorCode::TransactionIo,
-                    "reserved job entry cannot be enumerated",
-                )
-            })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(MaintenanceError::new(
-                    ErrorCode::RootIdentity,
-                    "reserved job contains an unexpected entry",
-                ));
-            }
-            let item_relative = format!("{relative}/{name}");
-            let Some(file) = open_relative_file(
-                root,
-                &item_relative,
-                FILE_READ_ATTRIBUTES.0 | DELETE.0,
-                false,
-                false,
-            )?
+    let job_relative = format!(".7launcher-maintenance/jobs/{job_id}");
+    let access = FILE_LIST_DIRECTORY.0 | DELETE.0;
+    // Resolve the job directory itself first, so a reparse point planted exactly at `{job_id}`
+    // is deleted as a link here rather than being traversed when `prepared`/`backup` are opened
+    // beneath it. An absent job directory leaves only the shared parents to reap.
+    if open_reserved_regular_directory(root, &job_relative, access)?.is_some() {
+        for leaf in ["prepared", "backup"] {
+            let leaf_relative = format!("{job_relative}/{leaf}");
+            let Some(directory) = open_reserved_regular_directory(root, &leaf_relative, access)?
             else {
                 continue;
             };
-            regular_file_snapshot(&file)?;
-            delete_by_handle(&file)?;
+            for name in directory_child_names(&directory)? {
+                if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(MaintenanceError::new(
+                        ErrorCode::RootIdentity,
+                        "reserved job contains an unexpected entry",
+                    ));
+                }
+                let item_relative = format!("{leaf_relative}/{name}");
+                let Some(file) = open_relative_file(
+                    root,
+                    &item_relative,
+                    FILE_READ_ATTRIBUTES.0 | DELETE.0,
+                    false,
+                    false,
+                )?
+                else {
+                    continue;
+                };
+                regular_file_snapshot(&file)?;
+                delete_by_handle(&file)?;
+            }
+            delete_by_handle(&directory).map_err(|_| {
+                MaintenanceError::new(
+                    ErrorCode::TransactionIo,
+                    "reserved job leaf cannot be removed",
+                )
+            })?;
         }
-        fs::remove_dir(&directory_path).map_err(|_| {
-            MaintenanceError::new(
-                ErrorCode::TransactionIo,
-                "reserved job leaf cannot be removed",
-            )
-        })?;
     }
+    // Remove the job directory, then its shared parents. A shared parent that still holds other
+    // jobs stays (previously tolerated as DirectoryNotEmpty); `open_reserved_regular_directory`
+    // deletes a link planted in place of any of them and reports it rather than following it.
     for relative in [
-        format!(".7launcher-maintenance/jobs/{job_id}"),
+        job_relative,
         ".7launcher-maintenance/jobs".to_owned(),
         ".7launcher-maintenance".to_owned(),
     ] {
-        let path = root.path.join(relative.replace('/', "\\"));
-        match fs::remove_dir(path) {
-            Ok(()) => {}
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-            Err(_) => {
-                return Err(MaintenanceError::new(
-                    ErrorCode::TransactionIo,
-                    "reserved job parent cannot be removed",
-                ));
-            }
+        let Some(directory) = open_reserved_regular_directory(root, &relative, access)? else {
+            continue;
+        };
+        if !directory_child_names(&directory)?.is_empty() {
+            continue;
         }
+        delete_by_handle(&directory).map_err(|_| {
+            MaintenanceError::new(
+                ErrorCode::TransactionIo,
+                "reserved job parent cannot be removed",
+            )
+        })?;
+        // Close the handle so delete-on-close completes before the next parent's emptiness is
+        // evaluated, preserving the previous synchronous cascade.
+        drop(directory);
     }
     Ok(())
+}
+
+/// Opens a reserved directory leaf and guarantees it is a real, non-reparse directory. When a
+/// reparse point occupies the leaf position, it is deleted as a link (the handle carries
+/// FILE_FLAG_OPEN_REPARSE_POINT, so the link's target is never touched) and a typed error is
+/// returned instead of the handle. Returns `Ok(None)` when the leaf, or any parent, is absent.
+fn open_reserved_regular_directory<'a>(
+    root: impl Into<RootLocation<'a>>,
+    relative_path: &str,
+    desired_access: u32,
+) -> Result<Option<File>> {
+    let Some(directory) = open_reserved_directory(root, relative_path, desired_access)? else {
+        return Ok(None);
+    };
+    if is_reparse_point(&directory)? {
+        delete_by_handle(&directory)?;
+        return Err(MaintenanceError::new(
+            ErrorCode::RootIdentity,
+            "reserved job entry is a reparse point",
+        ));
+    }
+    ensure_safe_directory(&directory)?;
+    Ok(Some(directory))
+}
+
+/// Opens a reserved directory as the leaf under its reparse-checked, identity-verified parent
+/// chain, without following or validating the leaf itself (the caller inspects it). The handle is
+/// opened with FILE_FLAG_OPEN_REPARSE_POINT and denies write/delete sharing, so a concurrent
+/// rename or junction swap of the leaf is blocked while the handle is held. Returns `None` when
+/// the leaf, or any parent, is absent.
+fn open_reserved_directory<'a>(
+    root: impl Into<RootLocation<'a>>,
+    relative_path: &str,
+    desired_access: u32,
+) -> Result<Option<File>> {
+    let components = relative_components(relative_path)?;
+    let (leaf, parents) = components.split_last().ok_or_else(|| {
+        MaintenanceError::new(ErrorCode::FileSetPath, "reserved directory path is empty")
+    })?;
+    let Some((locks, parent_path)) = lock_parent_chain(root, parents, false)? else {
+        return Ok(None);
+    };
+    let leaf_path = parent_path.join(leaf);
+    let opened = open_absolute(
+        &leaf_path,
+        desired_access,
+        FILE_SHARE_READ,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let directory = match opened {
+        Ok(directory) => directory,
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(_) => {
+            return Err(MaintenanceError::new(
+                ErrorCode::TransactionIo,
+                "reserved job directory cannot be opened under the locked root",
+            ));
+        }
+    };
+    let _parent_locks = locks;
+    Ok(Some(directory))
+}
+
+/// Enumerates a directory's immediate child names through the handle itself, never by resolving a
+/// path again, so the enumeration cannot be redirected through a reparse point swapped onto an
+/// ancestor between opening the handle and listing it.
+fn directory_child_names(directory: &File) -> Result<Vec<String>> {
+    // 8-byte aligned backing storage: FILE_ID_BOTH_DIR_INFO contains i64 fields, so the buffer
+    // must satisfy its alignment before any field is read through the cast.
+    let mut buffer = vec![0_u64; 8 * 1024];
+    let total_bytes = buffer.len() * size_of::<u64>();
+    let mut class = FileIdBothDirectoryRestartInfo;
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `buffer` is writable, 8-byte aligned, and `total_bytes` is its exact byte
+        // length. On success the selected information class fills it with a FILE_ID_BOTH_DIR_INFO
+        // chain; the handle stays valid through the synchronous call.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                raw_handle(directory),
+                class,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(total_bytes).unwrap_or(u32::MAX),
+            )
+        };
+        if let Err(error) = result {
+            if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) {
+                break;
+            }
+            return Err(MaintenanceError::new(
+                ErrorCode::TransactionIo,
+                "reserved job directory cannot be enumerated",
+            ));
+        }
+        // Subsequent calls continue the enumeration from where this one stopped.
+        class = FileIdBothDirectoryInfo;
+        let base = buffer.as_ptr().cast::<u8>();
+        let header = offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        let mut offset = 0_usize;
+        loop {
+            if offset
+                .checked_add(header)
+                .is_none_or(|end| end > total_bytes)
+            {
+                return Err(MaintenanceError::new(
+                    ErrorCode::TransactionIo,
+                    "reserved job directory enumeration is malformed",
+                ));
+            }
+            // SAFETY: `offset` is 8-byte aligned (it starts at 0 and advances by
+            // NextEntryOffset, which the filesystem keeps 8-aligned) and the fixed header lies
+            // within the buffer per the bound check above.
+            let info = unsafe { &*base.add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
+            let name_bytes = info.FileNameLength as usize;
+            if !name_bytes.is_multiple_of(size_of::<u16>())
+                || offset
+                    .checked_add(header)
+                    .and_then(|end| end.checked_add(name_bytes))
+                    .is_none_or(|end| end > total_bytes)
+            {
+                return Err(MaintenanceError::new(
+                    ErrorCode::TransactionIo,
+                    "reserved job directory enumeration is malformed",
+                ));
+            }
+            // SAFETY: the FileName array is `name_bytes` long and lies within the buffer per the
+            // bound check above.
+            let name_units = unsafe {
+                std::slice::from_raw_parts(
+                    ptr::addr_of!(info.FileName).cast::<u16>(),
+                    name_bytes / size_of::<u16>(),
+                )
+            };
+            let name = String::from_utf16(name_units).map_err(|_| {
+                MaintenanceError::new(
+                    ErrorCode::TransactionIo,
+                    "reserved job entry name is not Unicode",
+                )
+            })?;
+            if name != "." && name != ".." {
+                names.push(name);
+            }
+            let next = info.NextEntryOffset as usize;
+            if next == 0 {
+                break;
+            }
+            offset = offset.checked_add(next).ok_or_else(|| {
+                MaintenanceError::new(
+                    ErrorCode::TransactionIo,
+                    "reserved job directory enumeration is malformed",
+                )
+            })?;
+        }
+    }
+    Ok(names)
 }
 
 fn relative_components(relative_path: &str) -> Result<Vec<String>> {
@@ -5821,6 +5984,199 @@ mod windows_transaction_e2e_tests {
         assert_eq!(
             fs::read(root_path.join("target.txt")).unwrap(),
             b"replacement"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reserved_job_cleanup_tests {
+    use std::time::SystemTime;
+
+    use super::*;
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn create() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "seven-maintenance-reserved-cleanup-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create temp directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn register_root(root_path: &Path) -> RegisteredRoot {
+        let handle = open_absolute_directory(root_path, false).expect("open root");
+        let root = RegisteredRoot::from_canonical_identity(
+            "cleanup-root",
+            "cleanup-product",
+            crate::protocol::RootKind::Game,
+            final_path_owned(&handle)
+                .expect("canonical root")
+                .to_string_lossy(),
+            directory_identity(&handle).expect("root identity"),
+            "S-1-5-21-1000",
+        )
+        .expect("registered root");
+        drop(handle);
+        root
+    }
+
+    fn reserved(root_path: &Path, relative: &str) -> PathBuf {
+        root_path.join(relative.replace('/', "\\"))
+    }
+
+    #[test]
+    fn normal_cleanup_removes_the_whole_reserved_subtree() {
+        let directory = TempDirectory::create();
+        let root_path = directory.0.join("root");
+        fs::create_dir(&root_path).expect("create root");
+        let root = register_root(&root_path);
+
+        let job = ".7launcher-maintenance/jobs/cleanup-job";
+        fs::create_dir_all(reserved(&root_path, &format!("{job}/prepared"))).expect("prepared dir");
+        fs::create_dir_all(reserved(&root_path, &format!("{job}/backup"))).expect("backup dir");
+        fs::write(reserved(&root_path, &format!("{job}/prepared/0")), b"p0").expect("p0");
+        fs::write(reserved(&root_path, &format!("{job}/prepared/1")), b"p1").expect("p1");
+        fs::write(reserved(&root_path, &format!("{job}/backup/0")), b"b0").expect("b0");
+        // An unrelated file the user keeps in the library root must survive.
+        fs::write(root_path.join("keep.txt"), b"keep").expect("unrelated file");
+
+        cleanup_reserved_job(&root, "cleanup-job").expect("cleanup removes reserved job");
+
+        assert!(!root_path.join(".7launcher-maintenance").exists());
+        assert_eq!(fs::read(root_path.join("keep.txt")).expect("keep"), b"keep");
+    }
+
+    #[test]
+    fn cleanup_keeps_a_shared_parent_that_still_holds_another_job() {
+        let directory = TempDirectory::create();
+        let root_path = directory.0.join("root");
+        fs::create_dir(&root_path).expect("create root");
+        let root = register_root(&root_path);
+
+        fs::create_dir_all(reserved(
+            &root_path,
+            ".7launcher-maintenance/jobs/cleanup-job/prepared",
+        ))
+        .expect("prepared dir");
+        fs::write(
+            reserved(
+                &root_path,
+                ".7launcher-maintenance/jobs/cleanup-job/prepared/0",
+            ),
+            b"p0",
+        )
+        .expect("p0");
+        // A second, unrelated reserved job that cleanup must not touch or remove.
+        fs::create_dir_all(reserved(
+            &root_path,
+            ".7launcher-maintenance/jobs/other-job/prepared",
+        ))
+        .expect("other prepared dir");
+        fs::write(
+            reserved(
+                &root_path,
+                ".7launcher-maintenance/jobs/other-job/prepared/0",
+            ),
+            b"o0",
+        )
+        .expect("o0");
+
+        cleanup_reserved_job(&root, "cleanup-job").expect("cleanup removes only its own job");
+
+        assert!(
+            !reserved(&root_path, ".7launcher-maintenance/jobs/cleanup-job").exists(),
+            "the cleaned job is gone"
+        );
+        assert_eq!(
+            fs::read(reserved(
+                &root_path,
+                ".7launcher-maintenance/jobs/other-job/prepared/0"
+            ))
+            .expect("other job preserved"),
+            b"o0"
+        );
+    }
+
+    #[test]
+    fn a_junction_planted_as_a_job_entry_is_removed_without_touching_its_target() {
+        let directory = TempDirectory::create();
+        let root_path = directory.0.join("root");
+        fs::create_dir(&root_path).expect("create root");
+        let root = register_root(&root_path);
+
+        // An outside directory the attacker aims to have SYSTEM delete the contents of.
+        let outside = directory.0.join("outside");
+        fs::create_dir(&outside).expect("outside");
+        fs::write(outside.join("sentinel"), b"outside untouched").expect("sentinel");
+        // A numeric child so a naive handle-relative delete would pass the digit filter.
+        fs::write(outside.join("0"), b"outside payload").expect("outside payload");
+
+        let job = ".7launcher-maintenance/jobs/cleanup-job";
+        fs::create_dir_all(reserved(&root_path, &format!("{job}/backup"))).expect("backup dir");
+        // Replace `prepared` with a junction to the outside directory, the classic LPE primitive.
+        let prepared = reserved(&root_path, &format!("{job}/prepared"));
+        create_test_junction(&prepared, &outside);
+
+        let error = cleanup_reserved_job(&root, "cleanup-job")
+            .expect_err("cleanup must refuse a reparse point in the reserved namespace");
+        assert_eq!(error.code(), ErrorCode::RootIdentity);
+
+        // The planted link was removed; its target and the target's contents are intact.
+        assert!(!prepared.exists(), "the planted junction was removed");
+        assert!(outside.is_dir(), "the junction target survives");
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("sentinel survives"),
+            b"outside untouched"
+        );
+        assert_eq!(
+            fs::read(outside.join("0")).expect("outside payload survives"),
+            b"outside payload"
+        );
+    }
+
+    #[test]
+    fn a_junction_planted_as_the_job_directory_is_removed_without_following_it() {
+        let directory = TempDirectory::create();
+        let root_path = directory.0.join("root");
+        fs::create_dir(&root_path).expect("create root");
+        let root = register_root(&root_path);
+
+        let outside = directory.0.join("outside");
+        fs::create_dir_all(outside.join("prepared")).expect("outside prepared");
+        fs::write(outside.join("prepared").join("0"), b"outside payload").expect("payload");
+        fs::write(outside.join("sentinel"), b"outside untouched").expect("sentinel");
+
+        fs::create_dir_all(reserved(&root_path, ".7launcher-maintenance/jobs")).expect("jobs dir");
+        let job_link = reserved(&root_path, ".7launcher-maintenance/jobs/cleanup-job");
+        create_test_junction(&job_link, &outside);
+
+        let error = cleanup_reserved_job(&root, "cleanup-job")
+            .expect_err("cleanup must refuse a reparse point job directory");
+        assert_eq!(error.code(), ErrorCode::RootIdentity);
+
+        assert!(!job_link.exists(), "the planted job junction was removed");
+        assert!(outside.join("prepared").is_dir(), "target subtree survives");
+        assert_eq!(
+            fs::read(outside.join("prepared").join("0")).expect("payload survives"),
+            b"outside payload"
+        );
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("sentinel survives"),
+            b"outside untouched"
         );
     }
 }
